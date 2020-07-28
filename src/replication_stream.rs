@@ -43,6 +43,7 @@ trait PrivateReplicationStream {
     fn handle_response(&self, count: u64, resp: AppendEntriesResponse);
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ReplicationMode {
     LineRate,
     Lagging,
@@ -285,9 +286,11 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         count: u64,
         resp: AppendEntriesResponse,
     ) -> Result<(), ReplicationError> {
+        let is_up_to_date = resp.success && self.mode == ReplicationMode::LineRate;
+
         // Regardless of result, record the term
         self.owner
-            .call_record_term(resp.term)
+            .call_record_term(resp.term, self.node_id, is_up_to_date)
             .await
             .map_err(|_| ReplicationError::Stopping)?;
         self.awaiting_response = false;

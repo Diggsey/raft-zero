@@ -1,8 +1,8 @@
 use std::cmp;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use rand::{thread_rng, Rng};
 use tokio::time::{delay_until, Instant};
 
 use act_zero::*;
@@ -11,9 +11,11 @@ use crate::commit_state::{CommitStateActor, CommitStateExt, CommitStateReceiverI
 use crate::config::Config;
 use crate::connection::{Connection, ConnectionExt};
 use crate::messages::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, ClientResponse, ConflictOpt, Entry,
-    EntryNormal, EntryPayload, InstallSnapshotRequest, InstallSnapshotResponse, Membership,
-    ResponseMode, VoteRequest, VoteResponse, VotingGroup,
+    AppendEntriesRequest, AppendEntriesResponse, BootstrapRequest, ClientError, ClientRequest,
+    ClientResponse, ConflictOpt, Entry, EntryMembershipChange, EntryNormal, EntryPayload,
+    InstallSnapshotRequest, InstallSnapshotResponse, Membership, ResponseMode, SetMembersError,
+    SetMembersRequest, SetNonVotersError, SetNonVotersRequest, VoteRequest, VoteResponse,
+    VotingGroup,
 };
 use crate::replication_stream::{self, ReplicationStreamActor, ReplicationStreamExt};
 use crate::storage::{LogRange, Storage, StorageExt};
@@ -21,8 +23,13 @@ use crate::timer::TimerToken;
 use crate::types::{LogIndex, NodeId, Term};
 use crate::{spawn_actor, Application};
 
+type ClientResult<A> = Result<
+    ClientResponse<<A as Application>::LogResponse>,
+    ClientError<<A as Application>::LogError>,
+>;
+
 struct Notifier<A: Application> {
-    sender: Sender<Result<ClientResponse<A::LogResponse>, A::LogError>>,
+    sender: Sender<ClientResult<A>>,
     mode: ResponseMode,
 }
 
@@ -38,15 +45,21 @@ pub trait Node<A: Application> {
     fn append_entries(&self, req: AppendEntriesRequest<A>, res: Sender<AppendEntriesResponse>);
     fn install_snapshot(&self, req: InstallSnapshotRequest, res: Sender<InstallSnapshotResponse>);
 
+    // Initial setup
+    fn bootstrap_cluster(&self, req: BootstrapRequest, res: Sender<ClientResult<A>>);
+
     // Leader commands
-    fn client_request(
-        &self,
-        req: ClientRequest<A::LogData>,
-        res: Sender<Result<ClientResponse<A::LogResponse>, A::LogError>>,
-    );
+    fn client_request(&self, req: ClientRequest<A::LogData>, res: Sender<ClientResult<A>>);
+    fn set_members(&self, req: SetMembersRequest, res: Sender<ClientResult<A>>);
+    fn set_non_voters(&self, req: SetNonVotersRequest, res: Sender<ClientResult<A>>);
 }
 
-type ReplicationStreamMap<A> = HashMap<NodeId, Addr<Local<ReplicationStreamActor<A>>>>;
+struct ReplicationState<A: Application> {
+    is_up_to_date: bool,
+    addr: Addr<Local<ReplicationStreamActor<A>>>,
+}
+
+type ReplicationStreamMap<A> = HashMap<NodeId, ReplicationState<A>>;
 
 pub enum NodeError {
     StorageFailure,
@@ -69,6 +82,8 @@ struct CommonState<A: Application> {
     committed_index: LogIndex,
     committed_term: Term,
     committed_membership: Membership,
+    // Best guess at current leader, may not be accurate...
+    leader_id: Option<NodeId>,
 }
 
 impl<A: Application> CommonState<A> {
@@ -82,11 +97,16 @@ impl<A: Application> CommonState<A> {
             self.committed_term
         }
     }
+    fn is_membership_changing(&self) -> bool {
+        self.uncommitted_membership.is_joint() || self.committed_membership.is_joint()
+    }
     fn schedule_election_timeout(&mut self) {
-        self.this.set_timeout(
-            self.timer_token.inc(),
-            Instant::now() + self.config.election_timeout,
+        let timeout = thread_rng().gen_range(
+            self.config.min_election_timeout,
+            self.config.max_election_timeout,
         );
+        self.this
+            .set_timeout(self.timer_token.inc(), Instant::now() + timeout);
     }
     fn state_for_replication(&self) -> replication_stream::LeaderState {
         replication_stream::LeaderState {
@@ -106,18 +126,21 @@ impl<A: Application> CommonState<A> {
             .map(|(&node_id, conn)| {
                 (
                     node_id,
-                    prev_streams.remove(&node_id).unwrap_or_else(|| {
-                        spawn_actor(ReplicationStreamActor::new(
-                            node_id,
-                            self.this.clone(),
-                            self.this_id,
-                            self.state_for_replication(),
-                            self.config.clone(),
-                            conn.clone(),
-                            self.storage.clone(),
-                            commit_state.clone(),
-                        ))
-                    }),
+                    prev_streams
+                        .remove(&node_id)
+                        .unwrap_or_else(|| ReplicationState {
+                            is_up_to_date: false,
+                            addr: spawn_actor(ReplicationStreamActor::new(
+                                node_id,
+                                self.this.clone(),
+                                self.this_id,
+                                self.state_for_replication(),
+                                self.config.clone(),
+                                conn.clone(),
+                                self.storage.clone(),
+                                commit_state.clone(),
+                            )),
+                        }),
                 )
             })
             .collect()
@@ -199,6 +222,9 @@ impl<A: Application> CommonState<A> {
         &mut self,
         mut req: AppendEntriesRequest<A>,
     ) -> Result<AppendEntriesResponse, NodeError> {
+        // Update leader ID
+        self.leader_id = Some(req.leader_id);
+
         let mut has_membership_change = false;
 
         // Remove any entries prior to our commit index, as we know these match
@@ -258,14 +284,17 @@ impl<A: Application> CommonState<A> {
                         req.entries.drain(0..num_matching);
                     }
 
-                    // Remove conflicting uncommitted entries, and check them for membership changes
-                    if self
-                        .uncommitted_entries
-                        .drain(uncommitted_offset as usize..)
-                        .any(|x| x.entry.is_membership_change())
-                    {
-                        // Membership may have changed
-                        has_membership_change = true
+                    // If there exist conflicting entries left over
+                    if req.entries.is_empty() {
+                        // Remove conflicting uncommitted entries, and check them for membership changes
+                        if self
+                            .uncommitted_entries
+                            .drain(uncommitted_offset as usize..)
+                            .any(|x| x.entry.is_membership_change())
+                        {
+                            // Membership may have changed
+                            has_membership_change = true
+                        }
                     }
 
                     (true, None)
@@ -397,7 +426,7 @@ impl<A: Application> LeaderState<A> {
         {
             // Entry rejected by application, report the error to the caller
             if let Some(notify) = notify {
-                notify.sender.send(Err(e)).ok();
+                notify.sender.send(Err(ClientError::Application(e))).ok();
             }
             return Ok(());
         }
@@ -419,7 +448,8 @@ impl<A: Application> LeaderState<A> {
 
         // Replicate entry to other nodes
         for rs in self.replication_streams.values() {
-            rs.append_entry(state.state_for_replication(), entry.clone());
+            rs.addr
+                .append_entry(state.state_for_replication(), entry.clone());
         }
 
         Ok(())
@@ -547,6 +577,9 @@ impl<A: Application> NodeActor<A> {
                 .build_replication_streams(&commit_state, &mut HashMap::new()),
             commit_state,
         });
+
+        // Replicate a blank entry on election to ensure we have an entry from our own term
+        self.state.this.send_blank_entry();
     }
     fn validate_term(&mut self, term: Term) -> bool {
         if term > self.state.current_term {
@@ -560,6 +593,59 @@ impl<A: Application> NodeActor<A> {
         } else {
             true
         }
+    }
+    fn update_role_from_membership(&mut self) {
+        let committed_voter = self.state.committed_membership.is_voter(self.state.this_id);
+        let uncommitted_voter = self
+            .state
+            .uncommitted_membership
+            .is_voter(self.state.this_id);
+
+        match (&self.role, committed_voter, uncommitted_voter) {
+            // The Leader -> NonVoter transition is special, and doesn't occur until the membership
+            // change is committed.
+            (Role::Leader(_), false, false) => self.become_non_voter(),
+
+            // Other transitions occur immediately.
+            (Role::Candidate(_), _, false) | (Role::Follower, _, false) => self.become_non_voter(),
+            (Role::NonVoter, _, true) => self.become_follower(),
+
+            // Do nothing.
+            _ => {}
+        }
+    }
+    async fn internal_request(
+        &mut self,
+        payload: EntryPayload<A::LogData>,
+        notify: Option<Notifier<A>>,
+        rate_limited: bool,
+    ) -> Result<(), NodeError> {
+        if let Role::Leader(leader_state) = &mut self.role {
+            if !rate_limited
+                || (self.state.uncommitted_entries.len() as u64)
+                    < self.state.config.max_in_flight_requests.unwrap_or(u64::MAX)
+            {
+                leader_state
+                    .append_entry(&mut self.state, payload, notify)
+                    .await?;
+            } else {
+                // Too many in-flight requests already
+                if let Some(notify) = notify {
+                    notify.sender.send(Err(ClientError::Busy)).ok();
+                }
+            }
+        } else {
+            // Only the leader can respond to client requests
+            if let Some(notify) = notify {
+                notify
+                    .sender
+                    .send(Err(ClientError::NotLeader {
+                        leader_id: self.state.leader_id,
+                    }))
+                    .ok();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -581,25 +667,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
 
         if resp.success {
             // Check for role changes caused by membership changes
-            let is_voter = self
-                .state
-                .uncommitted_membership
-                .is_voter(self.state.this_id);
-            match self.role {
-                Role::Leader(_) => return Err(NodeError::SafetyViolation),
-                Role::NonVoter => {
-                    if is_voter {
-                        // We've just become a real member!
-                        self.become_follower();
-                    }
-                }
-                Role::Follower | Role::Candidate(_) => {
-                    if !is_voter {
-                        // We just got kicked out!
-                        self.become_non_voter();
-                    }
-                }
-            }
+            self.update_role_from_membership();
         }
 
         res.send(resp).ok();
@@ -616,45 +684,257 @@ impl<A: Application> Node<A> for NodeActor<A> {
     async fn client_request(
         &mut self,
         req: ClientRequest<A::LogData>,
-        res: Sender<Result<ClientResponse<A::LogResponse>, A::LogError>>,
+        res: Sender<ClientResult<A>>,
     ) -> Result<(), NodeError> {
-        if let Role::Leader(leader_state) = &mut self.role {
-            leader_state
-                .append_entry(
-                    &mut self.state,
-                    EntryPayload::Normal(EntryNormal { data: req.data }),
-                    Some(Notifier {
-                        sender: res,
-                        mode: req.response_mode,
-                    }),
-                )
-                .await?;
+        self.internal_request(
+            EntryPayload::Application(EntryNormal { data: req.data }),
+            Some(Notifier {
+                sender: res,
+                mode: req.response_mode,
+            }),
+            true,
+        )
+        .await
+    }
+    async fn set_members(
+        &mut self,
+        req: SetMembersRequest,
+        res: Sender<ClientResult<A>>,
+    ) -> Result<(), NodeError> {
+        // Check destination state for validity
+        if req.ids.is_empty() {
+            // Empty cluster is not allowed...
+            res.send(Err(ClientError::SetMembers(
+                SetMembersError::InvalidMembers,
+            )))
+            .ok();
+            return Ok(());
         }
-        Ok(())
+
+        // Check that we are sufficiently fault tolerant
+        if req.fault_tolerance > 0 {
+            let original_ids = &self.state.uncommitted_membership.voting_groups[0].members;
+
+            let old_fault_tolerance = (original_ids.len() as u64 - 1) / 2;
+            if old_fault_tolerance < req.fault_tolerance {
+                // Requested cluster is too small to provide desired fault tolerance
+                res.send(Err(ClientError::SetMembers(
+                    SetMembersError::InvalidFaultTolerance,
+                )))
+                .ok();
+                return Ok(());
+            }
+
+            let new_fault_tolerance = (req.ids.len() as u64 - 1) / 2;
+            if new_fault_tolerance < req.fault_tolerance {
+                // Requested cluster is too small to provide desired fault tolerance
+                res.send(Err(ClientError::SetMembers(
+                    SetMembersError::InvalidMembers,
+                )))
+                .ok();
+                return Ok(());
+            }
+
+            // At this point we know the old and new clusters each have at least 3 nodes
+            let static_ids = original_ids | &req.ids;
+            let added_ids = &req.ids - original_ids;
+            let removed_ids = original_ids - &req.ids;
+
+            // Check if we need to make the change in multiple steps
+            if static_ids.len() < added_ids.len() + req.fault_tolerance as usize {
+                // Work out how many add or remove operations must be cancelled before we can do it in one step
+                let mut needed_reduction =
+                    added_ids.len() + req.fault_tolerance as usize - static_ids.len();
+
+                // Try to balance out the actions we cancel
+                let balanced_reduction = cmp::min(
+                    cmp::min(added_ids.len(), removed_ids.len()),
+                    needed_reduction / 2,
+                );
+                let mut cancel_adds = balanced_reduction;
+                let mut cancel_removes = balanced_reduction;
+
+                // Compute unbalanced remainder
+                needed_reduction -= balanced_reduction * 2;
+                if removed_ids.len() >= balanced_reduction + needed_reduction {
+                    cancel_removes += needed_reduction;
+                } else {
+                    cancel_adds += needed_reduction;
+                }
+
+                let proposed_ids = static_ids
+                    .into_iter()
+                    .chain(removed_ids.into_iter().take(cancel_removes))
+                    .chain(added_ids.into_iter().skip(cancel_adds))
+                    .collect();
+
+                // Requested member change must be done in multiple steps
+                res.send(Err(ClientError::SetMembers(
+                    SetMembersError::InvalidTransition { proposed_ids },
+                )))
+                .ok();
+                return Ok(());
+            }
+        }
+
+        // Don't allow member changes whilst members are already changing
+        if self.state.is_membership_changing() {
+            res.send(Err(ClientError::SetMembers(SetMembersError::InvalidState)))
+                .ok();
+            return Ok(());
+        }
+
+        // Check if a majority of new nodes are up to date
+        if let Role::Leader(leader_state) = &mut self.role {
+            let lagging_ids: HashSet<NodeId> = req
+                .ids
+                .iter()
+                .copied()
+                .filter(|node_id| !leader_state.replication_streams[node_id].is_up_to_date)
+                .collect();
+            let num_up_to_date = req.ids.len() - lagging_ids.len();
+            if num_up_to_date == 0 || (((num_up_to_date - 1) / 2) as u64) < req.fault_tolerance {
+                // Too many lagging members
+                res.send(Err(ClientError::SetMembers(
+                    SetMembersError::LaggingMembers { ids: lagging_ids },
+                )))
+                .ok();
+                return Ok(());
+            }
+        }
+
+        // Everything is good to go, build the new membership configuration!
+        let mut membership = self.state.uncommitted_membership.clone();
+        membership
+            .voting_groups
+            .push(VotingGroup { members: req.ids });
+
+        self.internal_request(
+            EntryPayload::MembershipChange(EntryMembershipChange { membership }),
+            Some(Notifier {
+                sender: res,
+                mode: ResponseMode::Applied,
+            }),
+            true,
+        )
+        .await
+    }
+    async fn set_non_voters(
+        &mut self,
+        req: SetNonVotersRequest,
+        res: Sender<ClientResult<A>>,
+    ) -> Result<(), NodeError> {
+        // For simplicity, don't allow non-voter changes whilst members are changing
+        if self.state.is_membership_changing() {
+            res.send(Err(ClientError::SetNonVoters(
+                SetNonVotersError::InvalidState,
+            )))
+            .ok();
+            return Ok(());
+        }
+
+        // Don't allow members to be added as non-voters
+        let existing_voters: HashSet<NodeId> = req
+            .ids
+            .iter()
+            .copied()
+            .filter(|&node_id| self.state.uncommitted_membership.is_voter(node_id))
+            .collect();
+
+        if !existing_voters.is_empty() {
+            res.send(Err(ClientError::SetNonVoters(
+                SetNonVotersError::ExistingMembers {
+                    ids: existing_voters,
+                },
+            )))
+            .ok();
+            return Ok(());
+        }
+
+        // All good, make the change
+        let membership = Membership {
+            voting_groups: self.state.uncommitted_membership.voting_groups.clone(),
+            non_voters: req.ids,
+        };
+
+        self.internal_request(
+            EntryPayload::MembershipChange(EntryMembershipChange { membership }),
+            Some(Notifier {
+                sender: res,
+                mode: ResponseMode::Applied,
+            }),
+            true,
+        )
+        .await
+    }
+    async fn bootstrap_cluster(
+        &mut self,
+        req: BootstrapRequest,
+        res: Sender<ClientResult<A>>,
+    ) -> Result<(), NodeError> {
+        assert_eq!(
+            self.state.last_log_index(),
+            LogIndex::ZERO,
+            "Cannot bootstrap cluster when it already has log entries"
+        );
+
+        self.become_leader();
+        self.internal_request(
+            EntryPayload::MembershipChange(EntryMembershipChange {
+                membership: Membership {
+                    voting_groups: vec![VotingGroup {
+                        members: req.members,
+                    }],
+                    non_voters: req.non_voters,
+                },
+            }),
+            Some(Notifier {
+                sender: res,
+                mode: ResponseMode::Applied,
+            }),
+            false,
+        )
+        .await
     }
 }
 
 #[act_zero]
 impl<A: Application> CommitStateReceiver for NodeActor<A> {
-    async fn set_commit_index(&mut self, term: Term, commit_index: LogIndex) {
-        if let Role::Leader(_) = self.role {
+    async fn set_commit_index(
+        &mut self,
+        term: Term,
+        commit_index: LogIndex,
+    ) -> Result<(), NodeError> {
+        if let Role::Leader(leader_state) = &mut self.role {
             if self.state.current_term == term {
                 self.state.set_commit_index(commit_index).await;
 
-                // If we're not part of the new configuration, step down
-                if !self.state.committed_membership.is_voter(self.state.this_id) {
-                    if self
-                        .state
-                        .uncommitted_membership
-                        .is_voter(self.state.this_id)
+                // If we just committed a joint-consensus membership
+                if self.state.committed_membership.is_joint() {
+                    // If we haven't already requested to leave joint membership
+                    if self.state.uncommitted_membership.is_joint()
+                        && self.state.committed_membership == self.state.uncommitted_membership
                     {
-                        self.become_follower();
-                    } else {
-                        self.become_non_voter();
+                        // Request to leave joint membership
+                        let single_membership = self.state.uncommitted_membership.to_single();
+
+                        leader_state
+                            .append_entry(
+                                &mut self.state,
+                                EntryPayload::MembershipChange(EntryMembershipChange {
+                                    membership: single_membership,
+                                }),
+                                None,
+                            )
+                            .await?;
                     }
                 }
+
+                // If we're not part of the new configuration, step down
+                self.update_role_from_membership();
             }
         }
+        Ok(())
     }
 }
 
@@ -664,14 +944,15 @@ pub(crate) trait PrivateNode<A: Application> {
     fn timer_tick(&self, token: TimerToken);
     fn await_vote_response(&self, term: Term, from: NodeId, receiver: Receiver<VoteResponse>);
     fn record_vote_response(&self, term: Term, from: NodeId, resp: VoteResponse);
-    fn record_term(&self, term: Term, res: Sender<()>);
+    fn record_term(&self, term: Term, node_id: NodeId, is_up_to_date: bool, res: Sender<()>);
     fn send_log_response(
         &self,
         term: Term,
         index: LogIndex,
         receiver: Receiver<A::LogResponse>,
-        res: Sender<Result<ClientResponse<A::LogResponse>, A::LogError>>,
+        res: Sender<ClientResult<A>>,
     );
+    fn send_blank_entry(&self);
 }
 
 #[act_zero]
@@ -714,10 +995,20 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
             }
         }
     }
-    async fn record_term(&mut self, term: Term, res: Sender<()>) {
+    async fn record_term(
+        &mut self,
+        term: Term,
+        node_id: NodeId,
+        is_up_to_date: bool,
+        res: Sender<()>,
+    ) {
         self.validate_term(term);
 
-        if let Role::Leader(_) = &self.role {
+        if let Role::Leader(leader_state) = &mut self.role {
+            if let Some(rs) = leader_state.replication_streams.get_mut(&node_id) {
+                rs.is_up_to_date = is_up_to_date;
+            }
+
             res.send(()).ok();
         }
     }
@@ -726,9 +1017,9 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
         term: Term,
         index: LogIndex,
         receiver: Receiver<A::LogResponse>,
-        res: Sender<Result<ClientResponse<A::LogResponse>, A::LogError>>,
+        res: Sender<ClientResult<A>>,
     ) {
-        // Wait for the log entry to be applied, and the forward the response to the client
+        // Wait for the log entry to be applied, and the forward the response to the client.
         if let Ok(data) = receiver.await {
             res.send(Ok(ClientResponse {
                 data: Some(data),
@@ -737,5 +1028,14 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
             }))
             .ok();
         }
+    }
+    async fn send_blank_entry(&mut self) -> Result<(), NodeError> {
+        // If there are no log entries for our term yet, create a blank one to ensure stuff
+        // gets committed promptly.
+        if self.state.last_log_term() != self.state.current_term {
+            self.internal_request(EntryPayload::Blank, None, false)
+                .await?
+        }
+        Ok(())
     }
 }

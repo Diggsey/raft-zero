@@ -128,7 +128,7 @@ pub enum EntryPayload<D: LogData> {
     /// An empty payload committed by a new cluster leader.
     Blank,
     /// A normal log entry.
-    Normal(EntryNormal<D>),
+    Application(EntryNormal<D>),
     /// A membership change log entry.
     MembershipChange(EntryMembershipChange),
 }
@@ -166,6 +166,13 @@ pub struct Membership {
 impl Membership {
     pub fn is_joint(&self) -> bool {
         self.voting_groups.len() > 1
+    }
+    /// Should only be called when in joint consensus
+    pub fn to_single(&self) -> Membership {
+        Membership {
+            voting_groups: vec![self.voting_groups[1].clone()],
+            non_voters: self.non_voters.clone(),
+        }
     }
     pub fn map_members<V>(
         &self,
@@ -210,4 +217,70 @@ pub struct ClientResponse<R: LogResponse> {
     pub index: LogIndex,
     /// Only present if the entry has been committed
     pub data: Option<R>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClientError<E> {
+    NotLeader { leader_id: Option<NodeId> },
+    Busy,
+    Application(E),
+    SetMembers(SetMembersError),
+    SetNonVoters(SetNonVotersError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetMembersRequest {
+    /// These IDs must correspond to existing members or non-voters.
+    pub ids: HashSet<NodeId>,
+    /// Number of node failures we should remain tolerant to at all times.
+    pub fault_tolerance: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SetMembersError {
+    /// Cannot change members at this time. Possibly because a membership
+    /// change is already in progress.
+    InvalidState,
+    /// The requested members would produce a cluster which is not sufficiently
+    /// fault tolerant.
+    InvalidMembers,
+    /// The existing cluster already fails to meet the requested fault tolerance.
+    InvalidFaultTolerance,
+    /// One or more of the requested members were unknown to the leader. New
+    /// members must be added as non-voters first.
+    UnknownMembers { ids: HashSet<NodeId> },
+    /// Too many of the requested members are lagging too far behind to
+    /// safely continue.
+    LaggingMembers { ids: HashSet<NodeId> },
+    /// The cluster could not transition directly to the requested set of
+    /// members whilst remaining sufficiently fault tolerant.
+    InvalidTransition {
+        /// A proposed set of members which we could transition to whilst
+        /// remaining fault tolerant, and which takes us closer to the
+        /// requested set of members.
+        proposed_ids: HashSet<NodeId>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetNonVotersRequest {
+    /// These IDs must not correspond to existing members. To convert an
+    /// existing member to a non-voter, you must remove it as a member,
+    /// at which point it will automatically become a non-voter.
+    pub ids: HashSet<NodeId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SetNonVotersError {
+    /// Cannot change non-voters at this time. Possibly because a membership
+    /// change is already in progress.
+    InvalidState,
+    /// One or more of the requested non-voters is a member.
+    ExistingMembers { ids: HashSet<NodeId> },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BootstrapRequest {
+    pub members: HashSet<NodeId>,
+    pub non_voters: HashSet<NodeId>,
 }
