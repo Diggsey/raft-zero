@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use futures::task::{FutureObj, Spawn, SpawnError};
 
@@ -17,6 +18,8 @@ mod replication_stream;
 mod storage;
 mod timer;
 
+pub use node::{Node, NodeActor, NodeExt};
+
 pub trait LogData: Debug + Send + Sync + 'static {}
 pub trait LogResponse: Debug + Send + Sync + 'static {}
 
@@ -25,6 +28,8 @@ pub trait Application: Send + Sync + 'static {
     type LogResponse: LogResponse;
     type LogError: Send + Sync + 'static;
 
+    fn config(&self) -> Arc<config::Config>;
+    fn storage(&self) -> Addr<dyn storage::Storage<Self>>;
     fn establish_connection(&mut self, node_id: NodeId) -> Addr<dyn connection::Connection<Self>>;
 }
 

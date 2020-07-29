@@ -164,14 +164,33 @@ pub struct Membership {
 }
 
 impl Membership {
+    pub fn solo(node_id: NodeId) -> Self {
+        Self {
+            voting_groups: Vec::new(),
+            non_voters: Some(node_id).into_iter().collect(),
+        }
+    }
     pub fn is_joint(&self) -> bool {
         self.voting_groups.len() > 1
     }
     /// Should only be called when in joint consensus
     pub fn to_single(&self) -> Membership {
+        let new_non_voters = &self.voting_groups[0].members - &self.voting_groups[1].members;
         Membership {
             voting_groups: vec![self.voting_groups[1].clone()],
-            non_voters: self.non_voters.clone(),
+            non_voters: &self.non_voters | &new_non_voters,
+        }
+    }
+    /// Should only be called when not in joint consensus
+    pub fn to_joint(&self, new_members: HashSet<NodeId>) -> Membership {
+        Membership {
+            non_voters: &self.non_voters - &new_members,
+            voting_groups: vec![
+                self.voting_groups[0].clone(),
+                VotingGroup {
+                    members: new_members,
+                },
+            ],
         }
     }
     pub fn map_members<V>(
