@@ -1,4 +1,3 @@
-use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tokio::time::{delay_until, Instant};
@@ -10,8 +9,8 @@ use crate::connection::ConnectionExt;
 use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, BootstrapRequest, ClientError, ClientRequest,
     ClientResponse, EntryMembershipChange, EntryNormal, EntryPayload, InstallSnapshotRequest,
-    InstallSnapshotResponse, Membership, ResponseMode, SetMembersError, SetMembersRequest,
-    SetNonVotersError, SetNonVotersRequest, VoteRequest, VoteResponse, VotingGroup,
+    InstallSnapshotResponse, Membership, ResponseMode, SetLearnersError, SetLearnersRequest,
+    SetMembersError, SetMembersRequest, VoteRequest, VoteResponse, VotingGroup,
 };
 use crate::replication_stream::ReplicationStreamActor;
 use crate::storage::StorageExt;
@@ -45,7 +44,7 @@ pub trait Node<A: Application> {
     // Leader commands
     fn client_request(&self, req: ClientRequest<A::LogData>, res: Sender<ClientResult<A>>);
     fn set_members(&self, req: SetMembersRequest, res: Sender<ClientResult<A>>);
-    fn set_non_voters(&self, req: SetNonVotersRequest, res: Sender<ClientResult<A>>);
+    fn set_learners(&self, req: SetLearnersRequest, res: Sender<ClientResult<A>>);
 }
 
 pub(crate) struct ReplicationState<A: Application> {
@@ -63,7 +62,7 @@ pub enum NodeError {
 }
 
 enum Role<A: Application> {
-    NonVoter,
+    Learner,
     Follower,
     Candidate(CandidateState),
     Leader(LeaderState<A>),
@@ -112,7 +111,7 @@ impl<A: Application> NodeActor<A> {
                 committed_term: Term(0),
                 leader_id: None,
             },
-            role: Role::NonVoter,
+            role: Role::Learner,
         })
     }
 
@@ -141,12 +140,11 @@ impl<A: Application> NodeActor<A> {
         };
 
         for (&node_id, conn) in &self.state.connections {
-            // Don't send vote requests to non-voting members
+            // Don't bother sending vote requests to learners
             if !self
                 .state
                 .uncommitted_membership
-                .non_voters
-                .contains(&node_id)
+                .is_learner_or_unknown(node_id)
             {
                 // Send out the vote request, and spawn a background task to await it
                 self.state.this.await_vote_response(
@@ -162,8 +160,8 @@ impl<A: Application> NodeActor<A> {
         self.role = Role::Follower;
         self.state.schedule_election_timeout();
     }
-    fn become_non_voter(&mut self) {
-        self.role = Role::NonVoter;
+    fn become_learner(&mut self) {
+        self.role = Role::Learner;
         self.state.timer_token.inc();
     }
     fn become_leader(&mut self) {
@@ -175,27 +173,30 @@ impl<A: Application> NodeActor<A> {
             self.state.voted_for = None;
             self.state.save_hard_state().await?;
             match self.role {
-                Role::NonVoter => {}
+                Role::Learner => {}
                 _ => self.become_follower(),
             }
         }
         Ok(())
     }
     fn update_role_from_membership(&mut self) {
-        let committed_voter = self.state.committed_membership.is_voter(self.state.this_id);
-        let uncommitted_voter = self
+        let committed_learner = self
+            .state
+            .committed_membership
+            .is_learner_or_unknown(self.state.this_id);
+        let uncommitted_learner = self
             .state
             .uncommitted_membership
-            .is_voter(self.state.this_id);
+            .is_learner_or_unknown(self.state.this_id);
 
-        match (&self.role, committed_voter, uncommitted_voter) {
-            // The Leader -> NonVoter transition is special, and doesn't occur until the membership
+        match (&self.role, committed_learner, uncommitted_learner) {
+            // The Leader -> Learner transition is special, and doesn't occur until the membership
             // change is committed.
-            (Role::Leader(_), false, false) => self.become_non_voter(),
+            (Role::Leader(_), true, true) => self.become_learner(),
 
             // Other transitions occur immediately.
-            (Role::Candidate(_), _, false) | (Role::Follower, _, false) => self.become_non_voter(),
-            (Role::NonVoter, _, true) => self.become_follower(),
+            (Role::Candidate(_), _, true) | (Role::Follower, _, false) => self.become_learner(),
+            (Role::Learner, _, false) => self.become_follower(),
 
             // Do nothing.
             _ => {}
@@ -304,75 +305,55 @@ impl<A: Application> Node<A> for NodeActor<A> {
         }
 
         // Check that we are sufficiently fault tolerant
-        if req.fault_tolerance > 0 {
-            let original_ids = &self
-                .state
-                .uncommitted_membership
-                .voting_groups
-                .last()
-                .expect("At least one voting group at all times")
-                .members;
+        let original_ids = &self
+            .state
+            .uncommitted_membership
+            .voting_groups
+            .last()
+            .expect("At least one voting group at all times")
+            .members;
 
-            let old_fault_tolerance = (original_ids.len() as u64 - 1) / 2;
-            if old_fault_tolerance < req.fault_tolerance {
-                // Requested cluster is too small to provide desired fault tolerance
-                res.send(Err(ClientError::SetMembers(
-                    SetMembersError::InvalidFaultTolerance,
-                )))
-                .ok();
-                return Ok(());
-            }
+        let old_fault_tolerance = (original_ids.len() as u64 - 1) / 2;
+        if old_fault_tolerance < req.fault_tolerance {
+            // Current cluster is too small to provide desired fault tolerance
+            res.send(Err(ClientError::SetMembers(
+                SetMembersError::InvalidFaultTolerance,
+            )))
+            .ok();
+            return Ok(());
+        }
 
-            let new_fault_tolerance = (req.ids.len() as u64 - 1) / 2;
-            if new_fault_tolerance < req.fault_tolerance {
-                // Requested cluster is too small to provide desired fault tolerance
-                res.send(Err(ClientError::SetMembers(
-                    SetMembersError::InvalidMembers,
-                )))
-                .ok();
-                return Ok(());
-            }
+        let new_fault_tolerance = (req.ids.len() as u64 - 1) / 2;
+        if new_fault_tolerance < req.fault_tolerance {
+            // Requested cluster is too small to provide desired fault tolerance
+            res.send(Err(ClientError::SetMembers(
+                SetMembersError::InvalidMembers,
+            )))
+            .ok();
+            return Ok(());
+        }
 
-            // At this point we know the old and new clusters each have at least 3 nodes
-            let static_ids = original_ids | &req.ids;
+        // At this point we know the old and new clusters each have at least 3 nodes
+        let static_ids = original_ids & &req.ids;
+
+        // Check if we need to make the change in multiple steps
+        let excessive_changes = (req.fault_tolerance as i64) + 1 - (static_ids.len() as i64);
+        if excessive_changes > 0 {
             let added_ids = &req.ids - original_ids;
             let removed_ids = original_ids - &req.ids;
 
-            // Check if we need to make the change in multiple steps
-            if static_ids.len() < added_ids.len() + req.fault_tolerance as usize {
-                // Work out how many add or remove operations must be cancelled before we can do it in one step
-                let mut needed_reduction =
-                    added_ids.len() + req.fault_tolerance as usize - static_ids.len();
+            let proposed_ids = static_ids
+                .into_iter()
+                .chain(removed_ids.into_iter().take(excessive_changes as usize))
+                .chain(added_ids.into_iter().skip(excessive_changes as usize))
+                .collect();
 
-                // Try to balance out the actions we cancel
-                let balanced_reduction = cmp::min(
-                    cmp::min(added_ids.len(), removed_ids.len()),
-                    needed_reduction / 2,
-                );
-                let mut cancel_adds = balanced_reduction;
-                let mut cancel_removes = balanced_reduction;
-
-                // Compute unbalanced remainder
-                needed_reduction -= balanced_reduction * 2;
-                if removed_ids.len() >= balanced_reduction + needed_reduction {
-                    cancel_removes += needed_reduction;
-                } else {
-                    cancel_adds += needed_reduction;
-                }
-
-                let proposed_ids = static_ids
-                    .into_iter()
-                    .chain(removed_ids.into_iter().take(cancel_removes))
-                    .chain(added_ids.into_iter().skip(cancel_adds))
-                    .collect();
-
-                // Requested member change must be done in multiple steps
-                res.send(Err(ClientError::SetMembers(
-                    SetMembersError::InvalidTransition { proposed_ids },
-                )))
-                .ok();
-                return Ok(());
-            }
+            // Requested member change must be done in multiple steps
+            res.send(Err(ClientError::SetMembers(
+                SetMembersError::InvalidTransition { proposed_ids },
+            )))
+            .ok();
+            return Ok(());
         }
 
         // Don't allow member changes whilst members are already changing
@@ -414,32 +395,37 @@ impl<A: Application> Node<A> for NodeActor<A> {
         )
         .await
     }
-    async fn set_non_voters(
+    async fn set_learners(
         &mut self,
-        req: SetNonVotersRequest,
+        req: SetLearnersRequest,
         res: Sender<ClientResult<A>>,
     ) -> Result<(), NodeError> {
-        // For simplicity, don't allow non-voter changes whilst members are changing
+        // For simplicity, don't allow learner changes whilst members are changing
         if self.state.is_membership_changing() {
-            res.send(Err(ClientError::SetNonVoters(
-                SetNonVotersError::InvalidState,
+            res.send(Err(ClientError::SetLearners(
+                SetLearnersError::InvalidState,
             )))
             .ok();
             return Ok(());
         }
 
-        // Don't allow members to be added as non-voters
-        let existing_voters: HashSet<NodeId> = req
+        // Don't allow members to be added as learners
+        let existing_members: HashSet<NodeId> = req
             .ids
             .iter()
             .copied()
-            .filter(|&node_id| self.state.uncommitted_membership.is_voter(node_id))
+            .filter(|&node_id| {
+                !self
+                    .state
+                    .uncommitted_membership
+                    .is_learner_or_unknown(node_id)
+            })
             .collect();
 
-        if !existing_voters.is_empty() {
-            res.send(Err(ClientError::SetNonVoters(
-                SetNonVotersError::ExistingMembers {
-                    ids: existing_voters,
+        if !existing_members.is_empty() {
+            res.send(Err(ClientError::SetLearners(
+                SetLearnersError::ExistingMembers {
+                    ids: existing_members,
                 },
             )))
             .ok();
@@ -449,7 +435,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
         // All good, make the change
         let membership = Membership {
             voting_groups: self.state.uncommitted_membership.voting_groups.clone(),
-            non_voters: req.ids,
+            learners: req.ids,
         };
 
         self.internal_request(
@@ -480,7 +466,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
                     voting_groups: vec![VotingGroup {
                         members: req.members,
                     }],
-                    non_voters: req.non_voters,
+                    learners: req.learners,
                 },
             }),
             Some(Notifier {
@@ -599,8 +585,8 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
         }
 
         match &mut self.role {
-            // If we're a non-voter or leader, there's no timeout
-            Role::NonVoter | Role::Leader(_) => unreachable!(),
+            // If we're a learner or leader, there's no timeout
+            Role::Learner | Role::Leader(_) => unreachable!(),
             // If we're a follower, the timeout means we should convert to a candidate
             // If we're a candidate, the timeout means we should start a new election
             Role::Follower | Role::Candidate(_) => {

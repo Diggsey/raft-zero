@@ -160,14 +160,14 @@ pub struct Membership {
     /// by the new group.
     pub voting_groups: Vec<VotingGroup>,
     /// List of nodes which are not part of a voting group.
-    pub non_voters: HashSet<NodeId>,
+    pub learners: HashSet<NodeId>,
 }
 
 impl Membership {
     pub fn solo(node_id: NodeId) -> Self {
         Self {
             voting_groups: Vec::new(),
-            non_voters: Some(node_id).into_iter().collect(),
+            learners: Some(node_id).into_iter().collect(),
         }
     }
     pub fn is_joint(&self) -> bool {
@@ -175,16 +175,16 @@ impl Membership {
     }
     /// Should only be called when in joint consensus
     pub fn to_single(&self) -> Membership {
-        let new_non_voters = &self.voting_groups[0].members - &self.voting_groups[1].members;
+        let new_learners = &self.voting_groups[0].members - &self.voting_groups[1].members;
         Membership {
             voting_groups: vec![self.voting_groups[1].clone()],
-            non_voters: &self.non_voters | &new_non_voters,
+            learners: &self.learners | &new_learners,
         }
     }
     /// Should only be called when not in joint consensus
     pub fn to_joint(&self, new_members: HashSet<NodeId>) -> Membership {
         Membership {
-            non_voters: &self.non_voters - &new_members,
+            learners: &self.learners - &new_members,
             voting_groups: vec![
                 self.voting_groups[0].clone(),
                 VotingGroup {
@@ -195,7 +195,7 @@ impl Membership {
     }
     pub fn map_members<V>(
         &self,
-        voting_only: bool,
+        omit_learners: bool,
         mut f: impl FnMut(NodeId) -> V,
     ) -> HashMap<NodeId, V> {
         let mut result = HashMap::new();
@@ -204,15 +204,16 @@ impl Membership {
                 result.entry(member).or_insert_with(|| f(member));
             }
         }
-        if !voting_only {
-            for &member in &self.non_voters {
+        if !omit_learners {
+            for &member in &self.learners {
                 result.entry(member).or_insert_with(|| f(member));
             }
         }
         result
     }
-    pub fn is_voter(&self, node_id: NodeId) -> bool {
-        self.voting_groups
+    pub fn is_learner_or_unknown(&self, node_id: NodeId) -> bool {
+        !self
+            .voting_groups
             .iter()
             .any(|group| group.members.contains(&node_id))
     }
@@ -244,12 +245,12 @@ pub enum ClientError<E> {
     Busy,
     Application(E),
     SetMembers(SetMembersError),
-    SetNonVoters(SetNonVotersError),
+    SetLearners(SetLearnersError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SetMembersRequest {
-    /// These IDs must correspond to existing members or non-voters.
+    /// These IDs must correspond to existing members or learners.
     pub ids: HashSet<NodeId>,
     /// Number of node failures we should remain tolerant to at all times.
     pub fault_tolerance: u64,
@@ -266,7 +267,7 @@ pub enum SetMembersError {
     /// The existing cluster already fails to meet the requested fault tolerance.
     InvalidFaultTolerance,
     /// One or more of the requested members were unknown to the leader. New
-    /// members must be added as non-voters first.
+    /// members must be added as learners first.
     UnknownMembers { ids: HashSet<NodeId> },
     /// Too many of the requested members are lagging too far behind to
     /// safely continue.
@@ -282,24 +283,24 @@ pub enum SetMembersError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SetNonVotersRequest {
+pub struct SetLearnersRequest {
     /// These IDs must not correspond to existing members. To convert an
-    /// existing member to a non-voter, you must remove it as a member,
-    /// at which point it will automatically become a non-voter.
+    /// existing member to a learner, you must remove it as a member,
+    /// at which point it will automatically become a learner.
     pub ids: HashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum SetNonVotersError {
-    /// Cannot change non-voters at this time. Possibly because a membership
+pub enum SetLearnersError {
+    /// Cannot change learners at this time. Possibly because a membership
     /// change is already in progress.
     InvalidState,
-    /// One or more of the requested non-voters is a member.
+    /// One or more of the requested learners is a member.
     ExistingMembers { ids: HashSet<NodeId> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BootstrapRequest {
     pub members: HashSet<NodeId>,
-    pub non_voters: HashSet<NodeId>,
+    pub learners: HashSet<NodeId>,
 }
