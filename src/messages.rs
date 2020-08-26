@@ -195,18 +195,23 @@ impl Membership {
     }
     pub fn map_members<V>(
         &self,
+        omit_id: Option<NodeId>,
         omit_learners: bool,
         mut f: impl FnMut(NodeId) -> V,
     ) -> HashMap<NodeId, V> {
         let mut result = HashMap::new();
         for group in &self.voting_groups {
             for &member in &group.members {
-                result.entry(member).or_insert_with(|| f(member));
+                if Some(member) != omit_id {
+                    result.entry(member).or_insert_with(|| f(member));
+                }
             }
         }
         if !omit_learners {
             for &member in &self.learners {
-                result.entry(member).or_insert_with(|| f(member));
+                if Some(member) != omit_id {
+                    result.entry(member).or_insert_with(|| f(member));
+                }
             }
         }
         result

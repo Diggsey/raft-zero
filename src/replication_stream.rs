@@ -1,6 +1,3 @@
-use std::cmp::Ordering;
-use std::collections::VecDeque;
-use std::ops::Range;
 use std::sync::Arc;
 
 use tokio::time::{delay_until, timeout_at, Instant};
@@ -12,12 +9,13 @@ use crate::config::Config;
 use crate::connection::{Connection, ConnectionExt};
 use crate::messages::{AppendEntriesRequest, AppendEntriesResponse, Entry};
 use crate::node::{NodeActor, PrivateNodeExt};
-use crate::storage::{LogRange, Storage, StorageExt};
+use crate::seekable_buffer::{SeekDir, SeekableBuffer};
+use crate::storage::{Storage, StorageExt};
 use crate::timer::TimerToken;
 use crate::types::{LogIndex, NodeId, Term};
 use crate::Application;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct LeaderState {
     pub term: Term,
     pub commit_index: LogIndex,
@@ -28,6 +26,7 @@ pub(crate) struct LeaderState {
 #[act_zero]
 pub(crate) trait ReplicationStream<A: Application> {
     fn append_entry(&self, leader_state: LeaderState, entry: Arc<Entry<A::LogData>>);
+    fn update_leader_state(&self, leader_state: LeaderState);
 }
 
 #[act_zero]
@@ -43,12 +42,6 @@ trait PrivateReplicationStream {
     fn handle_response(&self, count: u64, resp: AppendEntriesResponse);
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum ReplicationMode {
-    LineRate,
-    Lagging,
-}
-
 pub enum ReplicationError {
     Stopping,
     StorageFailure,
@@ -60,10 +53,8 @@ pub(crate) struct ReplicationStreamActor<A: Application> {
     owner: WeakAddr<Local<NodeActor<A>>>,
     leader_id: NodeId,
     leader_state: LeaderState,
-    mode: ReplicationMode,
-    prev_log_index: LogIndex,
     prev_log_term: Term,
-    buffer: VecDeque<Arc<Entry<A::LogData>>>,
+    buffer: SeekableBuffer<Arc<Entry<A::LogData>>>,
     config: Arc<Config>,
     timer_token: TimerToken,
     awaiting_response: bool,
@@ -83,16 +74,17 @@ impl<A: Application> ReplicationStreamActor<A> {
         storage: Addr<dyn Storage<A>>,
         commit_state: Addr<Local<CommitStateActor>>,
     ) -> Self {
+        let mut buffer = SeekableBuffer::new(config.max_replication_buffer_len as usize);
+        buffer.seek(leader_state.last_log_index.0 + 1);
+
         Self {
             this: WeakAddr::default(),
             node_id,
             owner,
             leader_id,
-            mode: ReplicationMode::LineRate,
-            prev_log_index: leader_state.last_log_index,
             prev_log_term: leader_state.last_log_term,
             leader_state,
-            buffer: VecDeque::new(),
+            buffer,
             config,
             timer_token: TimerToken::default(),
             awaiting_response: false,
@@ -101,100 +93,60 @@ impl<A: Application> ReplicationStreamActor<A> {
             commit_state,
         }
     }
-    async fn get_log_range(
-        &mut self,
-        range: Range<LogIndex>,
-    ) -> Result<LogRange<A::LogData>, ReplicationError> {
-        self.storage
-            .call_get_log_range(range)
-            .await
-            .map_err(|_| ReplicationError::StorageFailure)
+    fn prev_log_index(&self) -> LogIndex {
+        LogIndex(self.buffer.pos() - 1)
     }
     async fn adjust_match_index(
         &mut self,
         new_match_index: LogIndex,
     ) -> Result<(), ReplicationError> {
-        match new_match_index.cmp(&self.prev_log_index) {
-            Ordering::Equal => {}
-            Ordering::Greater => {
-                // We're advancing the match index
-                let count = new_match_index - self.prev_log_index;
-                self.prev_log_term = self.buffer[count as usize - 1].term;
-                self.buffer.drain(0..count as usize);
-                let last_buffered_index = self.prev_log_index + (self.buffer.len() as u64);
-
-                // If there are more entries to replicate
-                if last_buffered_index < self.leader_state.last_log_index {
-                    let desired_buffered_index =
-                        self.prev_log_index + self.config.max_append_entries_len;
-
-                    // And our buffer does not contain enough entries to send a max-sized RPC
-                    if desired_buffered_index > last_buffered_index {
-                        // We need to load more entries
-                        let log_range = self
-                            .get_log_range(last_buffered_index + 1..desired_buffered_index + 1)
-                            .await?;
-
-                        assert_eq!(log_range.prev_log_index, last_buffered_index);
-                        self.buffer.extend(log_range.entries);
-                    }
-                } else {
-                    // We caught up
-                    self.mode = ReplicationMode::LineRate;
-                }
-
-                // Update the commit state
-                self.commit_state.set_match_index(
-                    self.node_id,
-                    self.prev_log_index,
-                    self.prev_log_term,
-                );
+        match self.buffer.seek(new_match_index.0 + 1) {
+            SeekDir::Forward(items) => {
+                self.prev_log_term = items.last().expect("At least one item").term;
             }
-            Ordering::Less => {
-                // The match index is regressing
-                let count = self.prev_log_index - new_match_index;
-
-                // If we can preserve some entries in our buffer
-                if count < self.config.max_replication_buffer_len {
-                    let new_len = (self.config.max_replication_buffer_len - count) as usize;
-                    if new_len < self.buffer.len() {
-                        // We overran the buffer, switch to lagging mode
-                        self.buffer.truncate(new_len);
-                        self.mode = ReplicationMode::Lagging;
-                    }
-
-                    let log_range = self
-                        .get_log_range(new_match_index + 1..self.prev_log_index + 1)
-                        .await?;
-
-                    assert_eq!(log_range.prev_log_index, new_match_index);
-
-                    // Prepend loaded entries
-                    for entry in log_range.entries.into_iter().rev() {
-                        self.buffer.push_front(entry);
-                    }
-                    self.prev_log_index = new_match_index;
-                    self.prev_log_term = log_range.prev_log_term;
-                } else {
-                    // Clear the buffer and switch to lagging mode
-                    self.buffer.clear();
-                    self.mode = ReplicationMode::Lagging;
-
-                    let desired_buffered_index =
-                        new_match_index + self.config.max_append_entries_len;
-                    let log_range = self
-                        .get_log_range(new_match_index + 1..desired_buffered_index + 1)
-                        .await?;
-
-                    assert_eq!(log_range.prev_log_index, new_match_index);
-
-                    // Replace buffer with loaded entries
-                    self.buffer.extend(log_range.entries);
-                    self.prev_log_index = new_match_index;
-                    self.prev_log_term = log_range.prev_log_term;
-                }
+            SeekDir::Backward(mut gap) => {
+                let range = gap.range();
+                let log_range = self
+                    .storage
+                    .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
+                    .await
+                    .map_err(|_| ReplicationError::StorageFailure)?;
+                gap.fill(range.start, log_range.entries);
+                self.prev_log_term = log_range.prev_log_term;
+            }
+            SeekDir::Still => {}
+            SeekDir::Far(buffer) => {
+                let range = buffer.calc_fill_range(
+                    self.config.max_append_entries_len as usize,
+                    self.leader_state.last_log_index.0 + 1,
+                );
+                let log_range = self
+                    .storage
+                    .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
+                    .await
+                    .map_err(|_| ReplicationError::StorageFailure)?;
+                buffer.fill(range.start, log_range.entries);
+                self.prev_log_term = log_range.prev_log_term;
             }
         }
+
+        // Update the commit state
+        self.commit_state
+            .set_match_index(self.node_id, new_match_index, self.prev_log_term);
+
+        let range = self.buffer.calc_fill_range(
+            self.config.max_append_entries_len as usize,
+            self.leader_state.last_log_index.0 + 1,
+        );
+        if range.end > range.start {
+            let log_range = self
+                .storage
+                .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
+                .await
+                .map_err(|_| ReplicationError::StorageFailure)?;
+            self.buffer.fill(range.start, log_range.entries);
+        }
+
         Ok(())
     }
     async fn flush_buffer(&mut self) {
@@ -211,7 +163,7 @@ impl<A: Application> ReplicationStreamActor<A> {
             leader_id: self.leader_id,
             term: self.leader_state.term,
             leader_commit: self.leader_state.commit_index,
-            prev_log_index: self.prev_log_index,
+            prev_log_index: self.prev_log_index(),
             prev_log_term: self.prev_log_term,
             entries,
         });
@@ -238,19 +190,21 @@ impl<A: Application> Actor for ReplicationStreamActor<A> {
 
 #[act_zero]
 impl<A: Application> ReplicationStream<A> for ReplicationStreamActor<A> {
+    // The leader state should have the entry being appended as its last log index
     async fn append_entry(&mut self, leader_state: LeaderState, entry: Arc<Entry<A::LogData>>) {
         self.leader_state = leader_state;
-
-        if let ReplicationMode::LineRate = self.mode {
-            if (self.buffer.len() as u64) < self.config.max_replication_buffer_len {
-                self.buffer.push_back(entry);
-                // If we're idle, immediately send out the new entries
-                if !self.awaiting_response {
-                    self.flush_buffer().await;
-                }
-            } else {
-                self.mode = ReplicationMode::Lagging;
-            }
+        if self
+            .buffer
+            .fill(self.leader_state.last_log_index.0, Some(entry))
+            && !self.awaiting_response
+        {
+            self.flush_buffer().await;
+        }
+    }
+    async fn update_leader_state(&mut self, leader_state: LeaderState) {
+        self.leader_state = leader_state;
+        if !self.awaiting_response {
+            self.flush_buffer().await;
         }
     }
 }
@@ -286,7 +240,8 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         count: u64,
         resp: AppendEntriesResponse,
     ) -> Result<(), ReplicationError> {
-        let is_up_to_date = resp.success && self.mode == ReplicationMode::LineRate;
+        let is_up_to_date =
+            resp.success && self.buffer.end_pos() > self.leader_state.last_log_index.0;
 
         // Regardless of result, record the term
         self.owner
@@ -296,11 +251,12 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         self.awaiting_response = false;
 
         if resp.success {
-            self.adjust_match_index(self.prev_log_index + count).await?;
+            self.adjust_match_index(self.prev_log_index() + count)
+                .await?;
         } else if let Some(conflict) = resp.conflict_opt {
             self.adjust_match_index(conflict.index).await?;
-        } else if self.prev_log_index > LogIndex::ZERO {
-            self.adjust_match_index(self.prev_log_index - 1).await?;
+        } else if self.prev_log_index() > LogIndex::ZERO {
+            self.adjust_match_index(self.prev_log_index() - 1).await?;
         } else {
             // Can't go back any further, just retry
         }

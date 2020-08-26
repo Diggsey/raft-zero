@@ -1,18 +1,20 @@
+use std::collections::HashSet;
+
 use crate::messages::{Membership, VotingGroup};
 use crate::types::NodeId;
 
 // Counts votes within a single voting group
 #[derive(Default, Clone)]
 struct MajorityCounter {
-    votes_received: u64,
+    votes_received: HashSet<NodeId>,
     has_majority: bool,
 }
 
 impl MajorityCounter {
     fn add_vote(&mut self, from: NodeId, group: &VotingGroup) {
         if group.members.contains(&from) {
-            self.votes_received += 1;
-            if self.votes_received > (group.members.len() as u64) / 2 {
+            self.votes_received.insert(from);
+            if self.votes_received.len() > group.members.len() / 2 {
                 self.has_majority = true;
             }
         }

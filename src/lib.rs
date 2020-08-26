@@ -7,18 +7,21 @@ use act_zero::*;
 
 pub mod messages;
 
-pub mod types;
-use types::*;
-
 mod commit_state;
 mod config;
 mod connection;
 mod node;
 mod replication_stream;
+mod seekable_buffer;
 mod storage;
 mod timer;
+mod types;
 
+pub use config::Config;
+pub use connection::{Connection, ConnectionExt, ConnectionImpl};
 pub use node::{Node, NodeActor, NodeExt};
+pub use storage::{HardState, InitialState, LogRange, Storage, StorageExt, StorageImpl};
+pub use types::{LogIndex, NodeId, Term};
 
 pub trait LogData: Debug + Send + Sync + 'static {}
 pub trait LogResponse: Debug + Send + Sync + 'static {}
@@ -28,9 +31,9 @@ pub trait Application: Send + Sync + 'static {
     type LogResponse: LogResponse;
     type LogError: Send + Sync + 'static;
 
-    fn config(&self) -> Arc<config::Config>;
-    fn storage(&self) -> Addr<dyn storage::Storage<Self>>;
-    fn establish_connection(&mut self, node_id: NodeId) -> Addr<dyn connection::Connection<Self>>;
+    fn config(&self) -> Arc<Config>;
+    fn storage(&self) -> Addr<dyn Storage<Self>>;
+    fn establish_connection(&mut self, node_id: NodeId) -> Addr<dyn Connection<Self>>;
 }
 
 struct TokioSpawn;

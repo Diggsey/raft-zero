@@ -7,6 +7,7 @@ use crate::messages::{Entry, Membership};
 use crate::types::{LogIndex, NodeId, Term};
 use crate::{Application, LogData};
 
+#[derive(Debug, Clone)]
 pub struct InitialState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
@@ -18,12 +19,24 @@ pub struct InitialState {
     pub last_membership_applied: Membership,
 }
 
+#[derive(Debug)]
 pub struct LogRange<D: LogData> {
     pub prev_log_index: LogIndex,
     pub prev_log_term: Term,
     pub entries: Vec<Arc<Entry<D>>>,
 }
 
+impl<D: LogData> Clone for LogRange<D> {
+    fn clone(&self) -> Self {
+        Self {
+            prev_log_index: self.prev_log_index,
+            prev_log_term: self.prev_log_term,
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct HardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,

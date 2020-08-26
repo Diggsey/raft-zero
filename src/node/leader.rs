@@ -5,7 +5,7 @@ use act_zero::*;
 
 use crate::commit_state::{CommitStateActor, CommitStateExt};
 use crate::messages::{ClientError, Entry, EntryPayload};
-use crate::replication_stream::{ReplicationStreamActor, ReplicationStreamExt};
+use crate::replication_stream::{self, ReplicationStreamActor, ReplicationStreamExt};
 use crate::storage::StorageExt;
 use crate::types::NodeId;
 use crate::{spawn_actor, Application};
@@ -20,6 +20,7 @@ pub(crate) struct LeaderState<A: Application> {
 
 fn build_replication_streams<A: Application>(
     state: &CommonState<A>,
+    state_for_rep: replication_stream::LeaderState,
     commit_state: &Addr<Local<CommitStateActor>>,
     prev_streams: &mut ReplicationStreamMap<A>,
 ) -> ReplicationStreamMap<A> {
@@ -37,7 +38,7 @@ fn build_replication_streams<A: Application>(
                             node_id,
                             state.this.clone(),
                             state.this_id,
-                            state.state_for_replication(),
+                            state_for_rep.clone(),
                             state.config.clone(),
                             conn.clone(),
                             state.storage.clone(),
@@ -65,9 +66,12 @@ impl<A: Application> LeaderState<A> {
         // Replicate a blank entry on election to ensure we have an entry from our own term
         state.this.send_blank_entry();
 
+        let state_for_rep = state.state_for_replication();
+
         Self {
             replication_streams: build_replication_streams(
                 state,
+                state_for_rep,
                 &commit_state,
                 &mut HashMap::new(),
             ),
@@ -99,6 +103,10 @@ impl<A: Application> LeaderState<A> {
             return Ok(());
         }
 
+        // If this adds new members, we need to build their replication state
+        // based on the state prior to this entry being added, so save that here.
+        let prev_replication_state = state.state_for_replication();
+
         // Add this to our list of uncommmitted entries
         state.uncommitted_entries.push_back(UncommittedEntry {
             entry: entry.clone(),
@@ -110,17 +118,38 @@ impl<A: Application> LeaderState<A> {
             state.update_membership();
             self.commit_state
                 .set_membership(state.uncommitted_membership.clone());
-            self.replication_streams =
-                build_replication_streams(state, &self.commit_state, &mut self.replication_streams);
+
+            // Build the replication streams using the old replication state
+            self.replication_streams = build_replication_streams(
+                state,
+                prev_replication_state.clone(),
+                &self.commit_state,
+                &mut self.replication_streams,
+            );
         }
 
         // Replicate entry to other nodes
+        let new_replication_state = state.state_for_replication();
         for rs in self.replication_streams.values() {
             rs.addr
-                .append_entry(state.state_for_replication(), entry.clone());
+                .append_entry(new_replication_state.clone(), entry.clone());
         }
 
+        // Update our own match index
+        self.commit_state.set_match_index(
+            state.this_id,
+            state.last_log_index(),
+            state.last_log_term(),
+        );
+
         Ok(())
+    }
+
+    pub(crate) fn update_replication_state(&self, state: &CommonState<A>) {
+        let new_replication_state = state.state_for_replication();
+        for rs in self.replication_streams.values() {
+            rs.addr.update_leader_state(new_replication_state.clone());
+        }
     }
 
     pub(crate) fn is_up_to_date(&self, node_id: NodeId) -> bool {

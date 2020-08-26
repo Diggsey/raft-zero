@@ -21,7 +21,7 @@ impl CommitStateActor {
         commit_index: LogIndex,
         receiver: WeakAddr<dyn CommitStateReceiver>,
     ) -> Self {
-        let match_index = membership.map_members(true, |_| LogIndex::ZERO);
+        let match_index = membership.map_members(None, true, |_| LogIndex::ZERO);
         Self {
             term,
             membership,
@@ -80,9 +80,10 @@ impl CommitState for CommitStateActor {
         }
     }
     async fn set_membership(&mut self, membership: Membership) {
-        self.match_index = membership.map_members(true, |node_id| {
+        self.match_index = membership.map_members(None, true, |node_id| {
             self.match_index.get(&node_id).copied().unwrap_or_default()
         });
+        self.membership = membership;
         self.recalculate_commit_index();
     }
 }

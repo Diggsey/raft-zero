@@ -97,11 +97,13 @@ impl<A: Application> CommonState<A> {
 
         let app = &mut self.app;
         let connections = &mut self.connections;
-        self.connections = self.uncommitted_membership.map_members(false, |node_id| {
-            connections
-                .remove(&node_id)
-                .unwrap_or_else(|| app.establish_connection(node_id))
-        });
+        self.connections =
+            self.uncommitted_membership
+                .map_members(Some(self.this_id), false, |node_id| {
+                    connections
+                        .remove(&node_id)
+                        .unwrap_or_else(|| app.establish_connection(node_id))
+                });
     }
     pub(crate) fn is_up_to_date(&self, last_log_term: Term, last_log_index: LogIndex) -> bool {
         last_log_term > self.last_log_term()
@@ -166,6 +168,7 @@ impl<A: Application> CommonState<A> {
     ) -> Result<AppendEntriesResponse, NodeError> {
         // Update leader ID
         self.leader_id = Some(req.leader_id);
+        self.schedule_election_timeout();
 
         let mut has_membership_change = false;
 
@@ -227,7 +230,7 @@ impl<A: Application> CommonState<A> {
                     }
 
                     // If there exist conflicting entries left over
-                    if req.entries.is_empty() {
+                    if !req.entries.is_empty() {
                         // Remove conflicting uncommitted entries, and check them for membership changes
                         if self
                             .uncommitted_entries

@@ -195,7 +195,7 @@ impl<A: Application> NodeActor<A> {
             (Role::Leader(_), true, true) => self.become_learner(),
 
             // Other transitions occur immediately.
-            (Role::Candidate(_), _, true) | (Role::Follower, _, false) => self.become_learner(),
+            (Role::Candidate(_), _, true) | (Role::Follower, _, true) => self.become_learner(),
             (Role::Learner, _, false) => self.become_follower(),
 
             // Do nothing.
@@ -489,6 +489,9 @@ impl<A: Application> CommitStateReceiver for NodeActor<A> {
         if let Role::Leader(leader_state) = &mut self.role {
             if self.state.current_term == term {
                 self.state.set_commit_index(commit_index).await;
+
+                // Update replication streams with the commit index
+                leader_state.update_replication_state(&self.state);
 
                 // If we just committed a joint-consensus membership
                 if self.state.committed_membership.is_joint() {
