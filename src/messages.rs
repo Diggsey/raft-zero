@@ -154,7 +154,7 @@ pub struct VotingGroup {
     pub members: HashSet<NodeId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Membership {
     /// During joint consensus, there will be two voting groups. The old group will be first, followed
     /// by the new group.
@@ -164,6 +164,9 @@ pub struct Membership {
 }
 
 impl Membership {
+    pub fn empty() -> Self {
+        Self::default()
+    }
     pub fn solo(node_id: NodeId) -> Self {
         Self {
             voting_groups: Vec::new(),

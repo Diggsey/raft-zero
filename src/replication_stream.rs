@@ -182,8 +182,6 @@ impl<A: Application> Actor for ReplicationStreamActor<A> {
         Self: Sized,
     {
         self.this = addr.downgrade();
-        // Send the initial heartbeat
-        addr.timer_tick(self.timer_token.inc());
         Ok(())
     }
 }

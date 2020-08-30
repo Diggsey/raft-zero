@@ -53,7 +53,8 @@ fn build_replication_streams<A: Application>(
 impl<A: Application> LeaderState<A> {
     pub(crate) fn new(state: &mut CommonState<A>) -> Self {
         // Cancel any previous timeouts
-        state.timer_token.inc();
+        state.clear_election_timeout();
+        state.leader_id = Some(state.this_id);
 
         // Start tracking our commit state
         let commit_state = spawn_actor(CommitStateActor::new(
@@ -152,8 +153,10 @@ impl<A: Application> LeaderState<A> {
         }
     }
 
-    pub(crate) fn is_up_to_date(&self, node_id: NodeId) -> bool {
-        if let Some(rs) = self.replication_streams.get(&node_id) {
+    pub(crate) fn is_up_to_date(&self, this_id: NodeId, node_id: NodeId) -> bool {
+        if node_id == this_id {
+            true
+        } else if let Some(rs) = self.replication_streams.get(&node_id) {
             rs.is_up_to_date
         } else {
             false

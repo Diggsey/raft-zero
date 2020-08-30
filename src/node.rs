@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use tokio::time::{delay_until, Instant};
 
@@ -90,27 +90,8 @@ impl<A: Application> Actor for NodeActor<A> {
 
 impl<A: Application> NodeActor<A> {
     pub fn spawn(this_id: NodeId, app: A) -> Addr<Local<Self>> {
-        let config = app.config();
-        let storage = app.storage();
-        let membership = Membership::solo(this_id);
         spawn_actor(Self {
-            state: CommonState {
-                app,
-                this: WeakAddr::default(),
-                this_id,
-                current_term: Term(0),
-                voted_for: None,
-                storage,
-                timer_token: TimerToken::default(),
-                connections: HashMap::new(),
-                config,
-                uncommitted_membership: membership.clone(),
-                uncommitted_entries: VecDeque::new(),
-                committed_index: LogIndex::ZERO,
-                committed_membership: membership,
-                committed_term: Term(0),
-                leader_id: None,
-            },
+            state: CommonState::new(this_id, app),
             role: Role::Learner,
         })
     }
@@ -126,6 +107,7 @@ impl<A: Application> NodeActor<A> {
         self.state.current_term.inc();
         self.state.voted_for = Some(self.state.this_id);
         self.role = Role::Candidate(CandidateState::new(&self.state.uncommitted_membership));
+        self.state.mark_not_leader();
         self.state.schedule_election_timeout();
         self.state.save_hard_state().await?;
 
@@ -158,11 +140,13 @@ impl<A: Application> NodeActor<A> {
     }
     fn become_follower(&mut self) {
         self.role = Role::Follower;
+        self.state.mark_not_leader();
         self.state.schedule_election_timeout();
     }
     fn become_learner(&mut self) {
         self.role = Role::Learner;
-        self.state.timer_token.inc();
+        self.state.mark_not_leader();
+        self.state.clear_election_timeout();
     }
     fn become_leader(&mut self) {
         self.role = Role::Leader(LeaderState::new(&mut self.state));
@@ -247,6 +231,8 @@ impl<A: Application> Node<A> for NodeActor<A> {
         self.validate_term(req.term).await?;
 
         res.send(self.state.handle_vote_request(req).await?).ok();
+        self.state.update_observer();
+
         Ok(())
     }
     async fn append_entries(
@@ -264,6 +250,8 @@ impl<A: Application> Node<A> for NodeActor<A> {
         }
 
         res.send(resp).ok();
+        self.state.update_observer();
+
         Ok(())
     }
     async fn install_snapshot(
@@ -287,7 +275,10 @@ impl<A: Application> Node<A> for NodeActor<A> {
             }),
             true,
         )
-        .await
+        .await?;
+
+        self.state.update_observer();
+        Ok(())
     }
     async fn set_members(
         &mut self,
@@ -365,11 +356,12 @@ impl<A: Application> Node<A> for NodeActor<A> {
 
         // Check if a majority of new nodes are up to date
         if let Role::Leader(leader_state) = &mut self.role {
+            let this_id = self.state.this_id;
             let lagging_ids: HashSet<NodeId> = req
                 .ids
                 .iter()
                 .copied()
-                .filter(|&node_id| !leader_state.is_up_to_date(node_id))
+                .filter(|&node_id| !leader_state.is_up_to_date(this_id, node_id))
                 .collect();
             let num_up_to_date = req.ids.len() - lagging_ids.len();
             if num_up_to_date == 0 || (((num_up_to_date - 1) / 2) as u64) < req.fault_tolerance {
@@ -393,7 +385,10 @@ impl<A: Application> Node<A> for NodeActor<A> {
             }),
             true,
         )
-        .await
+        .await?;
+
+        self.state.update_observer();
+        Ok(())
     }
     async fn set_learners(
         &mut self,
@@ -446,7 +441,10 @@ impl<A: Application> Node<A> for NodeActor<A> {
             }),
             true,
         )
-        .await
+        .await?;
+
+        self.state.update_observer();
+        Ok(())
     }
     async fn bootstrap_cluster(
         &mut self,
@@ -458,7 +456,12 @@ impl<A: Application> Node<A> for NodeActor<A> {
             LogIndex::ZERO,
             "Cannot bootstrap cluster when it already has log entries"
         );
+        assert!(
+            self.state.voted_for.is_none(),
+            "Cannot bootstrap cluster when we already voted for a leader"
+        );
 
+        self.state.voted_for = Some(self.state.this_id);
         self.become_leader();
         self.internal_request(
             EntryPayload::MembershipChange(EntryMembershipChange {
@@ -475,7 +478,10 @@ impl<A: Application> Node<A> for NodeActor<A> {
             }),
             false,
         )
-        .await
+        .await?;
+
+        self.state.update_observer();
+        Ok(())
     }
 }
 
@@ -516,6 +522,7 @@ impl<A: Application> CommitStateReceiver for NodeActor<A> {
 
                 // If we're not part of the new configuration, step down
                 self.update_role_from_membership();
+                self.state.update_observer();
             }
         }
         Ok(())
@@ -575,6 +582,8 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
             self.state.update_membership();
         }
 
+        self.state.update_observer();
+
         Ok(())
     }
     async fn set_timeout(self: Addr<Local<NodeActor<A>>>, token: TimerToken, deadline: Instant) {
@@ -583,11 +592,11 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
     }
     async fn timer_tick(&mut self, token: TimerToken) -> Result<(), NodeError> {
         // Ignore spurious wake-ups from cancelled timeouts
-        if token != self.state.timer_token {
+        if !self.state.election_timed_out(token) {
             return Ok(());
         }
 
-        match &mut self.role {
+        match &self.role {
             // If we're a learner or leader, there's no timeout
             Role::Learner | Role::Leader(_) => unreachable!(),
             // If we're a follower, the timeout means we should convert to a candidate
@@ -596,6 +605,9 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
                 self.become_candidate().await?;
             }
         }
+
+        self.state.update_observer();
+
         Ok(())
     }
     async fn await_vote_response(
@@ -620,6 +632,7 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
                 self.received_vote(from)
             }
         }
+        self.state.update_observer();
         Ok(())
     }
     async fn record_term(
@@ -636,6 +649,7 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
 
             res.send(()).ok();
         }
+        self.state.update_observer();
         Ok(())
     }
     async fn send_log_response(
@@ -660,7 +674,8 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
         // gets committed promptly.
         if self.state.last_log_term() != self.state.current_term {
             self.internal_request(EntryPayload::Blank, None, false)
-                .await?
+                .await?;
+            self.state.update_observer();
         }
         Ok(())
     }

@@ -2,10 +2,18 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
+
+impl NodeId {
+    pub const INVALID: NodeId = NodeId(std::u64::MAX);
+}
+
+impl Default for NodeId {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
 
 #[derive(
     Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,

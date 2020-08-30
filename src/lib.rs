@@ -11,6 +11,7 @@ mod commit_state;
 mod config;
 mod connection;
 mod node;
+mod observer;
 mod replication_stream;
 mod seekable_buffer;
 mod storage;
@@ -19,7 +20,8 @@ mod types;
 
 pub use config::Config;
 pub use connection::{Connection, ConnectionExt, ConnectionImpl};
-pub use node::{Node, NodeActor, NodeExt};
+pub use node::{ClientResult, Node, NodeActor, NodeExt};
+pub use observer::{ObservedState, Observer, ObserverExt, ObserverImpl};
 pub use storage::{HardState, InitialState, LogRange, Storage, StorageExt, StorageImpl};
 pub use types::{LogIndex, NodeId, Term};
 
@@ -33,6 +35,9 @@ pub trait Application: Send + Sync + 'static {
 
     fn config(&self) -> Arc<Config>;
     fn storage(&self) -> Addr<dyn Storage<Self>>;
+    fn observer(&self) -> Addr<dyn Observer> {
+        Addr::default()
+    }
     fn establish_connection(&mut self, node_id: NodeId) -> Addr<dyn Connection<Self>>;
 }
 
