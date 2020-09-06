@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use rand::{thread_rng, Rng};
+use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
 use act_zero::*;
@@ -11,11 +12,11 @@ use crate::config::Config;
 use crate::connection::Connection;
 use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, ClientResponse, ConflictOpt, Entry, EntryPayload,
-    Membership, ResponseMode, VoteRequest, VoteResponse,
+    InstallSnapshotRequest, Membership, ResponseMode, VoteRequest, VoteResponse,
 };
 use crate::observer::{ObservedState, Observer, ObserverExt};
 use crate::replication_stream;
-use crate::storage::{HardState, LogRange, Storage, StorageExt};
+use crate::storage::{BoxAsyncWrite, HardState, LogRange, Snapshot, Storage, StorageExt};
 use crate::timer::TimerToken;
 use crate::types::{LogIndex, NodeId, Term};
 use crate::Application;
@@ -61,6 +62,7 @@ pub(crate) struct CommonState<A: Application> {
 
     // Other
     last_observed_state: ObservedState,
+    installing_snapshot: Option<(Snapshot<A::SnapshotId>, BoxAsyncWrite)>,
 }
 
 impl<A: Application> CommonState<A> {
@@ -92,6 +94,7 @@ impl<A: Application> CommonState<A> {
             timer_deadline: None,
 
             last_observed_state: ObservedState::default(),
+            installing_snapshot: None,
         }
     }
     pub(crate) fn update_observer(&mut self) {
@@ -190,6 +193,35 @@ impl<A: Application> CommonState<A> {
         term == self.current_term
             && (self.voted_for.is_none() || self.voted_for == Some(candidate_id))
     }
+    pub(crate) async fn load_log_state(&mut self) -> Result<(), NodeError> {
+        let log_state = self
+            .storage
+            .call_get_log_state()
+            .await
+            .map_err(|_| NodeError::StorageFailure)?;
+
+        let loaded_range = self
+            .storage
+            .call_get_log_range(log_state.last_log_applied + 1..log_state.last_log_index + 1)
+            .await
+            .map_err(|_| NodeError::StorageFailure)?
+            .log_range()
+            .ok_or(NodeError::SafetyViolation)?;
+
+        self.committed_index = log_state.last_log_index;
+        self.committed_term = loaded_range.prev_log_term;
+        self.committed_membership = log_state.last_membership_applied;
+        self.uncommitted_entries = loaded_range
+            .entries
+            .into_iter()
+            .map(|entry| UncommittedEntry {
+                entry,
+                notify: None,
+            })
+            .collect();
+        self.update_membership();
+        Ok(())
+    }
     pub(crate) async fn handle_vote_request(
         &mut self,
         req: VoteRequest,
@@ -237,6 +269,72 @@ impl<A: Application> CommonState<A> {
             .call_replicate_to_log(log_range)
             .await
             .map_err(|_| NodeError::StorageFailure)
+    }
+
+    pub(crate) async fn handle_install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest,
+    ) -> Result<bool, NodeError> {
+        // Ignore requests from old terms
+        if req.term != self.current_term {
+            return Ok(false);
+        }
+
+        // Update leader ID
+        self.leader_id = Some(req.leader_id);
+        if self.timer_deadline.is_some() {
+            // Push back election timeout
+            self.schedule_election_timeout();
+        }
+
+        // It's a new snapshot
+        if req.offset == 0 {
+            let (snapshot_id, target) = self
+                .storage
+                .call_create_snapshot()
+                .await
+                .map_err(|_| NodeError::StorageFailure)?;
+
+            self.installing_snapshot = Some((
+                Snapshot {
+                    id: snapshot_id,
+                    last_log_index: req.last_included_index,
+                    last_log_term: req.last_included_term,
+                },
+                target,
+            ));
+        }
+
+        if let Some((snapshot, mut target)) = self.installing_snapshot.take() {
+            target
+                .write_all(&req.data)
+                .await
+                .map_err(|_| NodeError::StorageFailure)?;
+
+            if req.done {
+                target
+                    .shutdown()
+                    .await
+                    .map_err(|_| NodeError::StorageFailure)?;
+
+                // Snapshot is useless, discard it
+                if snapshot.last_log_index < self.committed_index {
+                    return Ok(false);
+                }
+
+                self.storage
+                    .call_install_snapshot(snapshot)
+                    .await
+                    .map_err(|_| NodeError::StorageFailure)?;
+
+                self.load_log_state().await?;
+                return Ok(true);
+            } else {
+                self.installing_snapshot = Some((snapshot, target));
+            }
+        }
+
+        Ok(false)
     }
 
     pub(crate) async fn handle_append_entries(

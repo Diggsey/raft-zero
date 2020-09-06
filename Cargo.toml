@@ -9,6 +9,6 @@ edition = "2018"
 [dependencies]
 act-zero = { version = "0.2.1" }
 serde = { version = "1.0.114", features = ["derive", "rc"] }
-tokio = { version = "0.2.22", features = ["time", "rt-core"] }
+tokio = { version = "0.2.22", features = ["time", "rt-core", "io-util"] }
 futures = "0.3.5"
 rand = "0.7.3"

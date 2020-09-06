@@ -23,7 +23,7 @@ mod common;
 mod leader;
 
 use candidate::CandidateState;
-use common::{CommonState, Notifier, UncommittedEntry};
+use common::{CommonState, Notifier};
 use leader::LeaderState;
 
 pub type ClientResult<A> = Result<
@@ -81,19 +81,18 @@ impl<A: Application> Actor for NodeActor<A> {
         Self: Sized,
     {
         self.state.this = addr.downgrade();
-        // Run initialization
-        addr.init();
-
         Ok(())
     }
 }
 
 impl<A: Application> NodeActor<A> {
     pub fn spawn(this_id: NodeId, app: A) -> Addr<Local<Self>> {
-        spawn_actor(Self {
+        let addr = spawn_actor(Self {
             state: CommonState::new(this_id, app),
             role: Role::Learner,
-        })
+        });
+        addr.init();
+        addr
     }
 
     fn received_vote(&mut self, from: NodeId) {
@@ -256,10 +255,23 @@ impl<A: Application> Node<A> for NodeActor<A> {
     }
     async fn install_snapshot(
         &mut self,
-        _req: InstallSnapshotRequest,
-        _res: Sender<InstallSnapshotResponse>,
-    ) {
-        unimplemented!()
+        req: InstallSnapshotRequest,
+        res: Sender<InstallSnapshotResponse>,
+    ) -> Result<(), NodeError> {
+        self.validate_term(req.term).await?;
+
+        if self.state.handle_install_snapshot(req).await? {
+            // Check for role changes caused by membership changes
+            self.update_role_from_membership();
+        }
+
+        res.send(InstallSnapshotResponse {
+            term: self.state.current_term,
+        })
+        .ok();
+        self.state.update_observer();
+
+        Ok(())
     }
     // Leader commands
     async fn client_request(
@@ -550,38 +562,17 @@ pub(crate) trait PrivateNode<A: Application> {
 #[act_zero]
 impl<A: Application> PrivateNode<A> for NodeActor<A> {
     async fn init(&mut self) -> Result<(), NodeError> {
-        if let Some(initial_state) = self
+        let hard_state = self
             .state
             .storage
-            .call_get_initial_state()
+            .call_init()
             .await
-            .map_err(|_| NodeError::StorageFailure)?
-        {
-            let loaded_range = self
-                .state
-                .storage
-                .call_get_log_range(
-                    initial_state.last_log_applied + 1..initial_state.last_log_index + 1,
-                )
-                .await
-                .map_err(|_| NodeError::StorageFailure)?;
+            .map_err(|_| NodeError::StorageFailure)?;
 
-            self.state.current_term = initial_state.current_term;
-            self.state.voted_for = initial_state.voted_for;
-            self.state.committed_index = initial_state.last_log_index;
-            self.state.committed_term = loaded_range.prev_log_term;
-            self.state.committed_membership = initial_state.last_membership_applied;
-            self.state.uncommitted_entries = loaded_range
-                .entries
-                .into_iter()
-                .map(|entry| UncommittedEntry {
-                    entry,
-                    notify: None,
-                })
-                .collect();
-            self.state.update_membership();
-        }
+        self.state.current_term = hard_state.current_term;
+        self.state.voted_for = hard_state.voted_for;
 
+        self.state.load_log_state().await?;
         self.state.update_observer();
 
         Ok(())

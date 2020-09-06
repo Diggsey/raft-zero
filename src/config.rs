@@ -8,6 +8,7 @@ pub struct Config {
     pub(crate) max_replication_buffer_len: u64,
     pub(crate) max_append_entries_len: u64,
     pub(crate) max_in_flight_requests: Option<u64>,
+    pub(crate) snapshot_chunk_size: u64,
 }
 
 impl Config {
@@ -19,6 +20,7 @@ impl Config {
             max_replication_buffer_len: 256,
             max_append_entries_len: 64,
             max_in_flight_requests: Some(128),
+            snapshot_chunk_size: 16 * 1024,
         }
     }
     pub fn set_heartbeat_interval(&mut self, value: Duration) -> &mut Self {

@@ -4,16 +4,21 @@ use tokio::time::{delay_until, timeout_at, Instant};
 
 use act_zero::*;
 
-use crate::commit_state::{CommitStateActor, CommitStateExt};
+use crate::commit_state::CommitStateActor;
 use crate::config::Config;
-use crate::connection::{Connection, ConnectionExt};
-use crate::messages::{AppendEntriesRequest, AppendEntriesResponse, Entry};
+use crate::connection::Connection;
+use crate::messages::{AppendEntriesResponse, Entry, InstallSnapshotResponse};
 use crate::node::{NodeActor, PrivateNodeExt};
-use crate::seekable_buffer::{SeekDir, SeekableBuffer};
-use crate::storage::{Storage, StorageExt};
+use crate::storage::{Snapshot, Storage, StorageExt};
 use crate::timer::TimerToken;
 use crate::types::{LogIndex, NodeId, Term};
 use crate::Application;
+
+mod log_replication;
+mod snapshot_replication;
+
+use log_replication::LogReplication;
+use snapshot_replication::SnapshotReplication;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LeaderState {
@@ -32,14 +37,21 @@ pub(crate) trait ReplicationStream<A: Application> {
 #[act_zero]
 trait PrivateReplicationStream {
     fn timer_tick(&self, token: TimerToken);
-    fn await_response(
+    fn await_append_entries_response(
         &self,
         count: u64,
         receiver: Receiver<AppendEntriesResponse>,
         token: TimerToken,
         deadline: Instant,
     );
-    fn handle_response(&self, count: u64, resp: AppendEntriesResponse);
+    fn handle_append_entries_response(&self, count: u64, resp: AppendEntriesResponse);
+    fn await_install_snapshot_response(
+        &self,
+        receiver: Receiver<InstallSnapshotResponse>,
+        token: TimerToken,
+        deadline: Instant,
+    );
+    fn handle_install_snapshot_response(&self, resp: InstallSnapshotResponse);
 }
 
 pub enum ReplicationError {
@@ -47,20 +59,81 @@ pub enum ReplicationError {
     StorageFailure,
 }
 
-pub(crate) struct ReplicationStreamActor<A: Application> {
-    this: WeakAddr<Local<Self>>,
-    node_id: NodeId,
-    owner: WeakAddr<Local<NodeActor<A>>>,
-    leader_id: NodeId,
+enum ErrorOrChange<A: Application> {
+    Error(ReplicationError),
+    Change(ChangeMode<A>),
+}
+
+enum ChangeMode<A: Application> {
+    Log {
+        match_index: LogIndex,
+        match_term: Term,
+    },
+    Snapshot {
+        snapshot: Snapshot<A::SnapshotId>,
+    },
+}
+
+enum ReplicationMode<A: Application> {
+    Log(LogReplication<A>),
+    Snapshot(SnapshotReplication<A>),
+}
+
+impl<A: Application> ReplicationMode<A> {
+    fn is_up_to_date(&self, shared: &SharedState<A>) -> bool {
+        match self {
+            Self::Log(log_replication) => log_replication.is_up_to_date(shared),
+            Self::Snapshot(_) => false,
+        }
+    }
+    async fn fill_buffer(&mut self, shared: &mut SharedState<A>) -> Result<(), ErrorOrChange<A>> {
+        match self {
+            Self::Log(log_replication) => log_replication.fill_buffer(shared).await,
+            Self::Snapshot(snapshot_replication) => snapshot_replication.fill_buffer().await,
+        }
+    }
+    fn flush_buffer(&mut self, shared: &mut SharedState<A>) {
+        match self {
+            Self::Log(log_replication) => log_replication.flush_buffer(shared),
+            Self::Snapshot(snapshot_replication) => snapshot_replication.flush_buffer(shared),
+        }
+    }
+    async fn kickstart(&mut self, shared: &mut SharedState<A>) -> Result<(), ErrorOrChange<A>> {
+        self.fill_buffer(shared).await?;
+        self.flush_buffer(shared);
+        Ok(())
+    }
+    fn log_replication(&mut self) -> &mut LogReplication<A> {
+        match self {
+            Self::Log(log_replication) => log_replication,
+            Self::Snapshot(_) => unreachable!(),
+        }
+    }
+    fn snapshot_replication(&mut self) -> &mut SnapshotReplication<A> {
+        match self {
+            Self::Log(_) => unreachable!(),
+            Self::Snapshot(snapshot_replication) => snapshot_replication,
+        }
+    }
+}
+
+struct SharedState<A: Application> {
+    this: WeakAddr<Local<ReplicationStreamActor<A>>>,
     leader_state: LeaderState,
-    prev_log_term: Term,
-    buffer: SeekableBuffer<Arc<Entry<A::LogData>>>,
     config: Arc<Config>,
-    timer_token: TimerToken,
-    awaiting_response: bool,
     connection: Addr<dyn Connection<A>>,
     storage: Addr<dyn Storage<A>>,
     commit_state: Addr<Local<CommitStateActor>>,
+    awaiting_response: bool,
+    leader_id: NodeId,
+    node_id: NodeId,
+    timer_token: TimerToken,
+}
+
+pub(crate) struct ReplicationStreamActor<A: Application> {
+    owner: WeakAddr<Local<NodeActor<A>>>,
+    mode: ReplicationMode<A>,
+    shared: SharedState<A>,
 }
 
 impl<A: Application> ReplicationStreamActor<A> {
@@ -74,103 +147,76 @@ impl<A: Application> ReplicationStreamActor<A> {
         storage: Addr<dyn Storage<A>>,
         commit_state: Addr<Local<CommitStateActor>>,
     ) -> Self {
-        let mut buffer = SeekableBuffer::new(config.max_replication_buffer_len as usize);
-        buffer.seek(leader_state.last_log_index.0 + 1);
-
         Self {
-            this: WeakAddr::default(),
-            node_id,
             owner,
-            leader_id,
-            prev_log_term: leader_state.last_log_term,
-            leader_state,
-            buffer,
-            config,
-            timer_token: TimerToken::default(),
-            awaiting_response: false,
-            connection,
-            storage,
-            commit_state,
+            mode: ReplicationMode::Log(LogReplication::new(
+                &config,
+                leader_state.last_log_index,
+                leader_state.last_log_term,
+            )),
+            shared: SharedState {
+                this: WeakAddr::default(),
+                node_id,
+                leader_state,
+                config,
+                connection,
+                storage,
+                awaiting_response: false,
+                commit_state,
+                leader_id,
+                timer_token: TimerToken::default(),
+            },
         }
     }
-    fn prev_log_index(&self) -> LogIndex {
-        LogIndex(self.buffer.pos() - 1)
-    }
-    async fn adjust_match_index(
+    async fn handle_response(
         &mut self,
-        new_match_index: LogIndex,
+        term: Term,
+        is_up_to_date: bool,
     ) -> Result<(), ReplicationError> {
-        match self.buffer.seek(new_match_index.0 + 1) {
-            SeekDir::Forward(items) => {
-                self.prev_log_term = items.last().expect("At least one item").term;
-            }
-            SeekDir::Backward(mut gap) => {
-                let range = gap.range();
-                let log_range = self
-                    .storage
-                    .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
-                    .await
-                    .map_err(|_| ReplicationError::StorageFailure)?;
-                gap.fill(range.start, log_range.entries);
-                self.prev_log_term = log_range.prev_log_term;
-            }
-            SeekDir::Still => {}
-            SeekDir::Far(buffer) => {
-                let range = buffer.calc_fill_range(
-                    self.config.max_append_entries_len as usize,
-                    self.leader_state.last_log_index.0 + 1,
-                );
-                let log_range = self
-                    .storage
-                    .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
-                    .await
-                    .map_err(|_| ReplicationError::StorageFailure)?;
-                buffer.fill(range.start, log_range.entries);
-                self.prev_log_term = log_range.prev_log_term;
-            }
-        }
-
-        // Update the commit state
-        self.commit_state
-            .set_match_index(self.node_id, new_match_index, self.prev_log_term);
-
-        let range = self.buffer.calc_fill_range(
-            self.config.max_append_entries_len as usize,
-            self.leader_state.last_log_index.0 + 1,
-        );
-        if range.end > range.start {
-            let log_range = self
-                .storage
-                .call_get_log_range(LogIndex(range.start)..LogIndex(range.end))
-                .await
-                .map_err(|_| ReplicationError::StorageFailure)?;
-            self.buffer.fill(range.start, log_range.entries);
-        }
-
+        // Regardless of result, record the term
+        self.owner
+            .call_record_term(term, self.shared.node_id, is_up_to_date)
+            .await
+            .map_err(|_| ReplicationError::Stopping)?;
+        self.shared.awaiting_response = false;
         Ok(())
     }
-    async fn flush_buffer(&mut self) {
-        // Send the first N items from the buffer, without removing them
-        let entries: Vec<_> = self
-            .buffer
-            .iter()
-            .take(self.config.max_append_entries_len as usize)
-            .cloned()
-            .collect();
-        let count = entries.len() as u64;
-
-        let res = self.connection.call_append_entries(AppendEntriesRequest {
-            leader_id: self.leader_id,
-            term: self.leader_state.term,
-            leader_commit: self.leader_state.commit_index,
-            prev_log_index: self.prev_log_index(),
-            prev_log_term: self.prev_log_term,
-            entries,
-        });
-        let deadline = Instant::now() + self.config.heartbeat_interval;
-        self.awaiting_response = true;
-        self.this
-            .await_response(count, res, self.timer_token.inc(), deadline);
+    async fn handle_mode_change(
+        &mut self,
+        mut arg: Result<(), ErrorOrChange<A>>,
+    ) -> Result<(), ReplicationError> {
+        while match arg {
+            Err(ErrorOrChange::Change(ChangeMode::Log {
+                match_index,
+                match_term,
+            })) => {
+                self.mode = ReplicationMode::Log(LogReplication::new(
+                    &self.shared.config,
+                    match_index,
+                    match_term,
+                ));
+                Ok(true)
+            }
+            Err(ErrorOrChange::Change(ChangeMode::Snapshot { snapshot })) => {
+                let box_read = self
+                    .shared
+                    .storage
+                    .call_read_snapshot(snapshot.id.clone())
+                    .await
+                    .map_err(|_| ReplicationError::StorageFailure)?;
+                self.mode = ReplicationMode::Snapshot(SnapshotReplication::new(
+                    &self.shared.config,
+                    snapshot,
+                    box_read,
+                ));
+                Ok(true)
+            }
+            Err(ErrorOrChange::Error(e)) => Err(e),
+            Ok(()) => Ok(false),
+        }? {
+            arg = self.mode.kickstart(&mut self.shared).await;
+        }
+        Ok(())
     }
 }
 
@@ -181,7 +227,7 @@ impl<A: Application> Actor for ReplicationStreamActor<A> {
     where
         Self: Sized,
     {
-        self.this = addr.downgrade();
+        self.shared.this = addr.downgrade();
         Ok(())
     }
 }
@@ -190,19 +236,17 @@ impl<A: Application> Actor for ReplicationStreamActor<A> {
 impl<A: Application> ReplicationStream<A> for ReplicationStreamActor<A> {
     // The leader state should have the entry being appended as its last log index
     async fn append_entry(&mut self, leader_state: LeaderState, entry: Arc<Entry<A::LogData>>) {
-        self.leader_state = leader_state;
-        if self
-            .buffer
-            .fill(self.leader_state.last_log_index.0, Some(entry))
-            && !self.awaiting_response
-        {
-            self.flush_buffer().await;
+        self.shared.leader_state = leader_state;
+        if let ReplicationMode::Log(log_replication) = &mut self.mode {
+            log_replication.append_entry(&mut self.shared, entry).await;
         }
     }
     async fn update_leader_state(&mut self, leader_state: LeaderState) {
-        self.leader_state = leader_state;
-        if !self.awaiting_response {
-            self.flush_buffer().await;
+        self.shared.leader_state = leader_state;
+        if let ReplicationMode::Log(log_replication) = &mut self.mode {
+            if !self.shared.awaiting_response {
+                log_replication.flush_buffer(&mut self.shared);
+            }
         }
     }
 }
@@ -211,14 +255,14 @@ impl<A: Application> ReplicationStream<A> for ReplicationStreamActor<A> {
 impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
     async fn timer_tick(&mut self, token: TimerToken) {
         // Ignore spurious wake-ups from cancelled timeouts
-        if token != self.timer_token {
+        if token != self.shared.timer_token {
             return;
         }
 
         // It's time to send a heartbeat, even if the buffer is empty
-        self.flush_buffer().await;
+        self.mode.flush_buffer(&mut self.shared);
     }
-    async fn await_response(
+    async fn await_append_entries_response(
         self: Addr<Local<ReplicationStreamActor<A>>>,
         count: u64,
         receiver: Receiver<AppendEntriesResponse>,
@@ -227,42 +271,58 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
     ) {
         // Wait for the RPC response, at least until deadline has expired
         if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
-            self.handle_response(count, res);
+            self.handle_append_entries_response(count, res);
         }
         // Wait for deadline
         delay_until(deadline).await;
         self.timer_tick(token);
     }
-    async fn handle_response(
+    async fn handle_append_entries_response(
         &mut self,
         count: u64,
         resp: AppendEntriesResponse,
     ) -> Result<(), ReplicationError> {
-        let is_up_to_date =
-            resp.success && self.buffer.end_pos() > self.leader_state.last_log_index.0;
-
         // Regardless of result, record the term
-        self.owner
-            .call_record_term(resp.term, self.node_id, is_up_to_date)
-            .await
-            .map_err(|_| ReplicationError::Stopping)?;
-        self.awaiting_response = false;
+        let is_up_to_date = resp.success && self.mode.is_up_to_date(&self.shared);
+        self.handle_response(resp.term, is_up_to_date).await?;
 
-        if resp.success {
-            self.adjust_match_index(self.prev_log_index() + count)
-                .await?;
-        } else if let Some(conflict) = resp.conflict_opt {
-            self.adjust_match_index(conflict.index).await?;
-        } else if self.prev_log_index() > LogIndex::ZERO {
-            self.adjust_match_index(self.prev_log_index() - 1).await?;
+        let res = self
+            .mode
+            .log_replication()
+            .handle_append_entries_response(&mut self.shared, count, resp)
+            .await;
+
+        // Check if we need to switch replication modes
+        self.handle_mode_change(res).await
+    }
+    async fn await_install_snapshot_response(
+        self: Addr<Local<ReplicationStreamActor<A>>>,
+        receiver: Receiver<InstallSnapshotResponse>,
+        token: TimerToken,
+        deadline: Instant,
+    ) {
+        // Wait for the RPC response, at least until deadline has expired
+        if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
+            self.handle_install_snapshot_response(res);
         } else {
-            // Can't go back any further, just retry
+            // Wait for deadline
+            delay_until(deadline).await;
+            self.timer_tick(token);
         }
+    }
+    async fn handle_install_snapshot_response(
+        &mut self,
+        resp: InstallSnapshotResponse,
+    ) -> Result<(), ReplicationError> {
+        self.handle_response(resp.term, false).await?;
 
-        // Send the next batch
-        if !self.buffer.is_empty() {
-            self.flush_buffer().await;
-        }
-        Ok(())
+        let res = self
+            .mode
+            .snapshot_replication()
+            .handle_install_snapshot_response(&mut self.shared)
+            .await;
+
+        // Check if we need to switch replication modes
+        self.handle_mode_change(res).await
     }
 }

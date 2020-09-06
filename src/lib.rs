@@ -22,7 +22,10 @@ pub use config::Config;
 pub use connection::{Connection, ConnectionExt, ConnectionImpl};
 pub use node::{ClientResult, Node, NodeActor, NodeExt};
 pub use observer::{ObservedState, Observer, ObserverExt, ObserverImpl};
-pub use storage::{HardState, InitialState, LogRange, Storage, StorageExt, StorageImpl};
+pub use storage::{
+    BoxAsyncRead, BoxAsyncWrite, HardState, LogRange, LogRangeOrSnapshot, LogState, Snapshot,
+    Storage, StorageExt, StorageImpl,
+};
 pub use types::{LogIndex, NodeId, Term};
 
 pub trait LogData: Debug + Send + Sync + 'static {}
@@ -32,6 +35,7 @@ pub trait Application: Send + Sync + 'static {
     type LogData: LogData;
     type LogResponse: LogResponse;
     type LogError: Send + Sync + 'static;
+    type SnapshotId: Send + Sync + Debug + Clone + 'static;
 
     fn config(&self) -> Arc<Config>;
     fn storage(&self) -> Addr<dyn Storage<Self>>;
