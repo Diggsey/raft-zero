@@ -225,8 +225,8 @@ impl<A: Application> NodeActor<A> {
             self.state.voted_for = None;
             self.state.save_hard_state().await?;
             match self.role {
-                Role::Learner => {}
-                _ => self.become_follower(),
+                Role::Learner | Role::Applicant(_) | Role::Follower => {}
+                Role::Leader(_) | Role::Candidate(_) => self.become_follower(),
             }
         }
         Ok(())
