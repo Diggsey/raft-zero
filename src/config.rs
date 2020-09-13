@@ -9,6 +9,8 @@ pub struct Config {
     pub(crate) max_append_entries_len: u64,
     pub(crate) max_in_flight_requests: Option<u64>,
     pub(crate) snapshot_chunk_size: u64,
+    pub(crate) pre_vote: bool,
+    pub(crate) leader_stickiness: bool,
 }
 
 impl Config {
@@ -21,6 +23,8 @@ impl Config {
             max_append_entries_len: 64,
             max_in_flight_requests: Some(128),
             snapshot_chunk_size: 16 * 1024,
+            pre_vote: true,
+            leader_stickiness: true,
         }
     }
     pub fn set_heartbeat_interval(&mut self, value: Duration) -> &mut Self {
@@ -43,6 +47,14 @@ impl Config {
     }
     pub fn set_max_in_flight_requests(&mut self, value: Option<u64>) -> &mut Self {
         self.max_in_flight_requests = value;
+        self
+    }
+    pub fn set_pre_vote(&mut self, value: bool) -> &mut Self {
+        self.pre_vote = value;
+        self
+    }
+    pub fn set_leader_stickiness(&mut self, value: bool) -> &mut Self {
+        self.leader_stickiness = value;
         self
     }
 }

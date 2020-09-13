@@ -78,6 +78,28 @@ pub struct VoteResponse {
     pub vote_granted: bool,
 }
 
+/// An RPC invoked by candidates to gather votes (§5.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteRequest {
+    /// The term which we will enter if the pre-vote succeeds.
+    pub next_term: Term,
+    /// The candidate's ID.
+    pub candidate_id: NodeId,
+    /// The index of the candidate’s last log entry (§5.4).
+    pub last_log_index: LogIndex,
+    /// The term of the candidate’s last log entry (§5.4).
+    pub last_log_term: Term,
+}
+
+/// An RPC response to a `PreVoteRequest` message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteResponse {
+    /// The current term of the responding node, for the candidate to update itself.
+    pub term: Term,
+    /// Will be true if the candidate received a vote from the responder.
+    pub vote_granted: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstallSnapshotRequest {
     /// The leader's current term.

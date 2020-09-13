@@ -6,11 +6,13 @@ use act_zero::*;
 
 use crate::commit_state::CommitStateReceiverImpl;
 use crate::connection::ConnectionExt;
+use crate::election_state::ElectionState;
 use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, BootstrapRequest, ClientError, ClientRequest,
     ClientResponse, EntryMembershipChange, EntryNormal, EntryPayload, InstallSnapshotRequest,
-    InstallSnapshotResponse, Membership, ResponseMode, SetLearnersError, SetLearnersRequest,
-    SetMembersError, SetMembersRequest, VoteRequest, VoteResponse, VotingGroup,
+    InstallSnapshotResponse, Membership, PreVoteRequest, PreVoteResponse, ResponseMode,
+    SetLearnersError, SetLearnersRequest, SetMembersError, SetMembersRequest, VoteRequest,
+    VoteResponse, VotingGroup,
 };
 use crate::replication_stream::ReplicationStreamActor;
 use crate::storage::StorageExt;
@@ -18,11 +20,9 @@ use crate::timer::TimerToken;
 use crate::types::{LogIndex, NodeId, Term};
 use crate::{spawn_actor, Application};
 
-mod candidate;
 mod common;
 mod leader;
 
-use candidate::CandidateState;
 use common::{CommonState, Notifier};
 use leader::LeaderState;
 
@@ -37,6 +37,7 @@ pub trait Node<A: Application> {
     fn request_vote(&self, req: VoteRequest, res: Sender<VoteResponse>);
     fn append_entries(&self, req: AppendEntriesRequest<A>, res: Sender<AppendEntriesResponse>);
     fn install_snapshot(&self, req: InstallSnapshotRequest, res: Sender<InstallSnapshotResponse>);
+    fn request_pre_vote(&self, req: PreVoteRequest, res: Sender<PreVoteResponse>);
 
     // Initial setup
     fn bootstrap_cluster(&self, req: BootstrapRequest, res: Sender<ClientResult<A>>);
@@ -64,8 +65,19 @@ pub enum NodeError {
 enum Role<A: Application> {
     Learner,
     Follower,
-    Candidate(CandidateState),
+    Applicant(ElectionState),
+    Candidate(ElectionState),
     Leader(LeaderState<A>),
+}
+
+impl<A: Application> Role<A> {
+    fn is_learner(&self) -> bool {
+        if let Role::Learner = self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub struct NodeActor<A: Application> {
@@ -97,15 +109,23 @@ impl<A: Application> NodeActor<A> {
 
     fn received_vote(&mut self, from: NodeId) {
         if let Role::Candidate(candidate) = &mut self.role {
-            if candidate.add_vote(&self.state.uncommitted_membership, from) {
+            if candidate.add_vote(from) {
                 self.become_leader();
             }
         }
     }
+    async fn received_pre_vote(&mut self, from: NodeId) -> Result<(), NodeError> {
+        if let Role::Applicant(applicant) = &mut self.role {
+            if applicant.add_vote(from) {
+                self.become_candidate().await?;
+            }
+        }
+        Ok(())
+    }
     async fn become_candidate(&mut self) -> Result<(), NodeError> {
         self.state.current_term.inc();
         self.state.voted_for = Some(self.state.this_id);
-        self.role = Role::Candidate(CandidateState::new(&self.state.uncommitted_membership));
+        self.role = Role::Candidate(ElectionState::new(&self.state.uncommitted_membership));
         self.state.mark_not_leader();
         self.state.schedule_election_timeout();
         self.state.save_hard_state().await?;
@@ -137,6 +157,37 @@ impl<A: Application> NodeActor<A> {
         }
         Ok(())
     }
+    async fn become_applicant(&mut self) -> Result<(), NodeError> {
+        self.role = Role::Applicant(ElectionState::new(&self.state.uncommitted_membership));
+        self.state.mark_not_leader();
+        self.state.schedule_election_timeout();
+
+        self.received_pre_vote(self.state.this_id).await?;
+
+        let req = PreVoteRequest {
+            next_term: self.state.current_term.next(),
+            candidate_id: self.state.this_id,
+            last_log_index: self.state.last_log_index(),
+            last_log_term: self.state.last_log_term(),
+        };
+
+        for (&node_id, conn) in &self.state.connections {
+            // Don't bother sending vote requests to learners
+            if !self
+                .state
+                .uncommitted_membership
+                .is_learner_or_unknown(node_id)
+            {
+                // Send out the vote request, and spawn a background task to await it
+                self.state.this.await_pre_vote_response(
+                    self.state.current_term,
+                    node_id,
+                    conn.call_request_pre_vote(req.clone()),
+                );
+            }
+        }
+        Ok(())
+    }
     fn become_follower(&mut self) {
         self.role = Role::Follower;
         self.state.mark_not_leader();
@@ -150,7 +201,7 @@ impl<A: Application> NodeActor<A> {
     fn become_leader(&mut self) {
         self.role = Role::Leader(LeaderState::new(&mut self.state));
     }
-    async fn validate_term(&mut self, term: Term) -> Result<(), NodeError> {
+    async fn acknowledge_term(&mut self, term: Term) -> Result<(), NodeError> {
         if term > self.state.current_term {
             self.state.current_term = term;
             self.state.voted_for = None;
@@ -178,7 +229,9 @@ impl<A: Application> NodeActor<A> {
             (Role::Leader(_), true, true) => self.become_learner(),
 
             // Other transitions occur immediately.
-            (Role::Candidate(_), _, true) | (Role::Follower, _, true) => self.become_learner(),
+            (Role::Candidate(_), _, true)
+            | (Role::Follower, _, true)
+            | (Role::Applicant(_), _, true) => self.become_learner(),
             (Role::Learner, _, false) => self.become_follower(),
 
             // Do nothing.
@@ -218,6 +271,39 @@ impl<A: Application> NodeActor<A> {
         }
         Ok(())
     }
+    async fn acknowledge_leader(&mut self, leader_id: NodeId) {
+        self.state.leader_id = Some(leader_id);
+        if !self.role.is_learner() {
+            self.become_follower();
+        }
+    }
+    fn should_betray_leader(&self) -> bool {
+        // If leader stickiness is enabled, reject pre-votes unless
+        // we haven't heard from the leader in a while.
+        if self.state.config.leader_stickiness {
+            match &self.role {
+                Role::Follower | Role::Leader(_) => false,
+                Role::Applicant(_) | Role::Candidate(_) | Role::Learner => true,
+            }
+        } else {
+            true
+        }
+    }
+
+    fn handle_vote_request(&mut self, req: &VoteRequest) -> bool {
+        self.state.can_vote_for(req.term, req.candidate_id)
+            && self
+                .state
+                .is_up_to_date(req.last_log_term, req.last_log_index)
+            && (self.state.config.pre_vote || self.should_betray_leader())
+    }
+    fn handle_pre_vote_request(&self, req: &PreVoteRequest) -> bool {
+        req.next_term >= self.state.current_term
+            && self
+                .state
+                .is_up_to_date(req.last_log_term, req.last_log_index)
+            && self.should_betray_leader()
+    }
 }
 
 #[act_zero]
@@ -227,21 +313,48 @@ impl<A: Application> Node<A> for NodeActor<A> {
         req: VoteRequest,
         res: Sender<VoteResponse>,
     ) -> Result<(), NodeError> {
-        self.validate_term(req.term).await?;
+        self.acknowledge_term(req.term).await?;
 
-        res.send(self.state.handle_vote_request(req).await?).ok();
+        let vote_granted = self.handle_vote_request(&req);
+        if vote_granted {
+            self.state.voted_for = Some(req.candidate_id);
+            self.state.save_hard_state().await?;
+        }
+
+        res.send(VoteResponse {
+            term: self.state.current_term,
+            vote_granted,
+        })
+        .ok();
         self.state.update_observer();
 
         Ok(())
+    }
+    async fn request_pre_vote(&mut self, req: PreVoteRequest, res: Sender<PreVoteResponse>) {
+        res.send(PreVoteResponse {
+            term: self.state.current_term,
+            vote_granted: self.handle_pre_vote_request(&req),
+        })
+        .ok();
     }
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<A>,
         res: Sender<AppendEntriesResponse>,
     ) -> Result<(), NodeError> {
-        self.validate_term(req.term).await?;
+        self.acknowledge_term(req.term).await?;
 
-        let resp = self.state.handle_append_entries(req).await?;
+        // Ignore requests from old terms
+        let resp = if req.term != self.state.current_term {
+            AppendEntriesResponse {
+                success: false,
+                term: self.state.current_term,
+                conflict_opt: None,
+            }
+        } else {
+            self.acknowledge_leader(req.leader_id).await;
+            self.state.handle_append_entries(req).await?
+        };
 
         if resp.success {
             // Check for role changes caused by membership changes
@@ -258,11 +371,15 @@ impl<A: Application> Node<A> for NodeActor<A> {
         req: InstallSnapshotRequest,
         res: Sender<InstallSnapshotResponse>,
     ) -> Result<(), NodeError> {
-        self.validate_term(req.term).await?;
+        self.acknowledge_term(req.term).await?;
 
-        if self.state.handle_install_snapshot(req).await? {
-            // Check for role changes caused by membership changes
-            self.update_role_from_membership();
+        // Ignore requests from old terms
+        if req.term == self.state.current_term {
+            self.acknowledge_leader(req.leader_id).await;
+            if self.state.handle_install_snapshot(req).await? {
+                // Check for role changes caused by membership changes
+                self.update_role_from_membership();
+            }
         }
 
         res.send(InstallSnapshotResponse {
@@ -547,7 +664,14 @@ pub(crate) trait PrivateNode<A: Application> {
     fn set_timeout(&self, token: TimerToken, deadline: Instant);
     fn timer_tick(&self, token: TimerToken);
     fn await_vote_response(&self, term: Term, from: NodeId, receiver: Receiver<VoteResponse>);
+    fn await_pre_vote_response(
+        &self,
+        term: Term,
+        from: NodeId,
+        receiver: Receiver<PreVoteResponse>,
+    );
     fn record_vote_response(&self, term: Term, from: NodeId, resp: VoteResponse);
+    fn record_pre_vote_response(&self, term: Term, from: NodeId, resp: PreVoteResponse);
     fn record_term(&self, term: Term, node_id: NodeId, is_up_to_date: bool, res: Sender<()>);
     fn send_log_response(
         &self,
@@ -587,12 +711,16 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
             return Ok(());
         }
 
-        match &self.role {
+        match &mut self.role {
             // If we're a learner or leader, there's no timeout
             Role::Learner | Role::Leader(_) => unreachable!(),
+            // If we're a follower or applicant and pre-vote is enabled, begin pre-vote
+            Role::Follower | Role::Applicant(_) if self.state.config.pre_vote => {
+                self.become_applicant().await?;
+            }
             // If we're a follower, the timeout means we should convert to a candidate
             // If we're a candidate, the timeout means we should start a new election
-            Role::Follower | Role::Candidate(_) => {
+            Role::Follower | Role::Applicant(_) | Role::Candidate(_) => {
                 self.become_candidate().await?;
             }
         }
@@ -611,16 +739,41 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
             self.record_vote_response(term, from, resp);
         }
     }
+    async fn await_pre_vote_response(
+        self: Addr<Local<NodeActor<A>>>,
+        term: Term,
+        from: NodeId,
+        receiver: Receiver<PreVoteResponse>,
+    ) {
+        if let Ok(resp) = receiver.await {
+            self.record_pre_vote_response(term, from, resp);
+        }
+    }
     async fn record_vote_response(
         &mut self,
         term: Term,
         from: NodeId,
         resp: VoteResponse,
     ) -> Result<(), NodeError> {
-        self.validate_term(resp.term).await?;
+        self.acknowledge_term(resp.term).await?;
         if term == self.state.current_term {
             if resp.vote_granted {
                 self.received_vote(from)
+            }
+        }
+        self.state.update_observer();
+        Ok(())
+    }
+    async fn record_pre_vote_response(
+        &mut self,
+        term: Term,
+        from: NodeId,
+        resp: PreVoteResponse,
+    ) -> Result<(), NodeError> {
+        self.acknowledge_term(resp.term).await?;
+        if term == self.state.current_term {
+            if resp.vote_granted {
+                self.received_pre_vote(from).await?;
             }
         }
         self.state.update_observer();
@@ -633,7 +786,7 @@ impl<A: Application> PrivateNode<A> for NodeActor<A> {
         is_up_to_date: bool,
         res: Sender<()>,
     ) -> Result<(), NodeError> {
-        self.validate_term(term).await?;
+        self.acknowledge_term(term).await?;
 
         if let Role::Leader(leader_state) = &mut self.role {
             leader_state.set_up_to_date(node_id, is_up_to_date);

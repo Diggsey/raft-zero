@@ -10,6 +10,7 @@ pub mod messages;
 mod commit_state;
 mod config;
 mod connection;
+mod election_state;
 mod node;
 mod observer;
 mod replication_stream;

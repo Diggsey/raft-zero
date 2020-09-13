@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::connection::Connection;
 use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, ClientResponse, ConflictOpt, Entry, EntryPayload,
-    InstallSnapshotRequest, Membership, ResponseMode, VoteRequest, VoteResponse,
+    InstallSnapshotRequest, Membership, ResponseMode,
 };
 use crate::observer::{ObservedState, Observer, ObserverExt};
 use crate::replication_stream;
@@ -222,23 +222,6 @@ impl<A: Application> CommonState<A> {
         self.update_membership();
         Ok(())
     }
-    pub(crate) async fn handle_vote_request(
-        &mut self,
-        req: VoteRequest,
-    ) -> Result<VoteResponse, NodeError> {
-        let vote_granted = self.can_vote_for(req.term, req.candidate_id)
-            && self.is_up_to_date(req.last_log_term, req.last_log_index);
-
-        if vote_granted {
-            self.voted_for = Some(req.candidate_id);
-            self.save_hard_state().await?;
-        }
-
-        Ok(VoteResponse {
-            term: self.current_term,
-            vote_granted,
-        })
-    }
 
     pub(crate) async fn replicate_to_log(
         &mut self,
@@ -275,18 +258,6 @@ impl<A: Application> CommonState<A> {
         &mut self,
         req: InstallSnapshotRequest,
     ) -> Result<bool, NodeError> {
-        // Ignore requests from old terms
-        if req.term != self.current_term {
-            return Ok(false);
-        }
-
-        // Update leader ID
-        self.leader_id = Some(req.leader_id);
-        if self.timer_deadline.is_some() {
-            // Push back election timeout
-            self.schedule_election_timeout();
-        }
-
         // It's a new snapshot
         if req.offset == 0 {
             let (snapshot_id, target) = self
@@ -341,22 +312,6 @@ impl<A: Application> CommonState<A> {
         &mut self,
         mut req: AppendEntriesRequest<A>,
     ) -> Result<AppendEntriesResponse, NodeError> {
-        // Ignore requests from old terms
-        if req.term != self.current_term {
-            return Ok(AppendEntriesResponse {
-                success: false,
-                term: self.current_term,
-                conflict_opt: None,
-            });
-        }
-
-        // Update leader ID
-        self.leader_id = Some(req.leader_id);
-        if self.timer_deadline.is_some() {
-            // Push back election timeout
-            self.schedule_election_timeout();
-        }
-
         let mut has_membership_change = false;
 
         // Remove any entries prior to our commit index, as we know these match

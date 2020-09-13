@@ -24,6 +24,9 @@ impl Term {
     pub fn inc(&mut self) {
         self.0 += 1;
     }
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 #[derive(
