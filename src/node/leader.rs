@@ -38,6 +38,7 @@ fn build_replication_streams<A: Application>(
                             node_id,
                             state.this.clone(),
                             state.this_id,
+                            state.database_id,
                             state_for_rep.clone(),
                             state.config.clone(),
                             conn.clone(),

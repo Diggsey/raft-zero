@@ -132,6 +132,7 @@ impl<A: Application> LogReplication<A> {
 
         let res = shared.connection.call_append_entries(AppendEntriesRequest {
             leader_id: shared.leader_id,
+            database_id: shared.database_id,
             term: shared.leader_state.term,
             leader_commit: shared.leader_state.commit_index,
             prev_log_index: self.prev_log_index(),

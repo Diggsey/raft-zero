@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use log::error;
 use tokio::time::{delay_until, Instant};
 
 use act_zero::*;
@@ -18,7 +19,7 @@ use crate::messages::{
 use crate::replication_stream::ReplicationStreamActor;
 use crate::storage::StorageExt;
 use crate::timer::TimerToken;
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::{spawn_actor, Application};
 
 mod common;
@@ -57,10 +58,12 @@ pub(crate) struct ReplicationState<A: Application> {
 type ReplicationStreamMap<A> = HashMap<NodeId, ReplicationState<A>>;
 
 #[doc(hidden)]
+#[derive(Debug)]
 pub enum NodeError {
     StorageFailure,
     // Returned if the "State Machine Safety" property is violated
     SafetyViolation,
+    DatabaseMismatch,
 }
 
 enum Role<A: Application> {
@@ -95,6 +98,18 @@ impl<A: Application> Actor for NodeActor<A> {
     {
         self.state.this = addr.downgrade();
         Ok(())
+    }
+    fn errored_fut(error: Self::Error) -> bool {
+        error!("{:?}", error);
+        false
+    }
+    fn errored_mut(&mut self, error: Self::Error) -> bool {
+        let terminal = match error {
+            NodeError::DatabaseMismatch => false,
+            _ => true,
+        };
+        self.errored(error);
+        terminal
     }
 }
 
@@ -135,6 +150,7 @@ impl<A: Application> NodeActor<A> {
         self.received_vote(self.state.this_id);
 
         let req = VoteRequest {
+            database_id: self.state.database_id,
             term: self.state.current_term,
             candidate_id: self.state.this_id,
             last_log_index: self.state.last_log_index(),
@@ -166,6 +182,7 @@ impl<A: Application> NodeActor<A> {
         self.received_pre_vote(self.state.this_id).await?;
 
         let req = PreVoteRequest {
+            database_id: self.state.database_id,
             next_term: self.state.current_term.next(),
             candidate_id: self.state.this_id,
             last_log_index: self.state.last_log_index(),
@@ -278,6 +295,17 @@ impl<A: Application> NodeActor<A> {
             self.become_follower();
         }
     }
+    async fn acknowledge_database_id(&mut self, database_id: DatabaseId) -> Result<(), NodeError> {
+        if !self.state.database_id.is_set() {
+            self.state.database_id = database_id;
+            self.state.save_hard_state().await?;
+        }
+        if self.state.database_id == database_id {
+            Ok(())
+        } else {
+            Err(NodeError::DatabaseMismatch)
+        }
+    }
     fn should_betray_leader(&self) -> bool {
         // If leader stickiness is enabled, reject pre-votes unless
         // we haven't heard from the leader in a while.
@@ -296,7 +324,7 @@ impl<A: Application> NodeActor<A> {
             && self
                 .state
                 .is_up_to_date(req.last_log_term, req.last_log_index)
-            && (self.state.config.pre_vote || self.should_betray_leader())
+            && self.should_betray_leader()
     }
     fn handle_pre_vote_request(&self, req: &PreVoteRequest) -> bool {
         req.next_term >= self.state.current_term
@@ -314,6 +342,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
         req: VoteRequest,
         res: Sender<VoteResponse>,
     ) -> Result<(), NodeError> {
+        self.acknowledge_database_id(req.database_id).await?;
         self.acknowledge_term(req.term).await?;
 
         let vote_granted = self.handle_vote_request(&req);
@@ -331,18 +360,25 @@ impl<A: Application> Node<A> for NodeActor<A> {
 
         Ok(())
     }
-    async fn request_pre_vote(&mut self, req: PreVoteRequest, res: Sender<PreVoteResponse>) {
+    async fn request_pre_vote(
+        &mut self,
+        req: PreVoteRequest,
+        res: Sender<PreVoteResponse>,
+    ) -> Result<(), NodeError> {
+        self.acknowledge_database_id(req.database_id).await?;
         res.send(PreVoteResponse {
             term: self.state.current_term,
             vote_granted: self.handle_pre_vote_request(&req),
         })
         .ok();
+        Ok(())
     }
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<A>,
         res: Sender<AppendEntriesResponse>,
     ) -> Result<(), NodeError> {
+        self.acknowledge_database_id(req.database_id).await?;
         self.acknowledge_term(req.term).await?;
 
         // Ignore requests from old terms
@@ -372,6 +408,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
         req: InstallSnapshotRequest,
         res: Sender<InstallSnapshotResponse>,
     ) -> Result<(), NodeError> {
+        self.acknowledge_database_id(req.database_id).await?;
         self.acknowledge_term(req.term).await?;
 
         // Ignore requests from old terms
@@ -596,17 +633,18 @@ impl<A: Application> Node<A> for NodeActor<A> {
         req: BootstrapRequest,
         res: Sender<ClientResult<A>>,
     ) -> Result<(), NodeError> {
-        assert_eq!(
-            self.state.last_log_index(),
-            LogIndex::ZERO,
-            "Cannot bootstrap cluster when it already has log entries"
-        );
+        let cluster_initialized = self.state.database_id.is_set()
+            || self.state.last_log_index() != LogIndex::ZERO
+            || self.state.voted_for.is_some();
         assert!(
-            self.state.voted_for.is_none(),
-            "Cannot bootstrap cluster when we already voted for a leader"
+            !cluster_initialized,
+            "Cannot bootstrap cluster once it's already been initialized"
         );
 
+        self.state.database_id = DatabaseId::new();
         self.state.voted_for = Some(self.state.this_id);
+        self.state.save_hard_state().await?;
+
         self.become_leader();
         self.internal_request(
             EntryPayload::MembershipChange(EntryMembershipChange {

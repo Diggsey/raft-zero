@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use act_zero::*;
 
 use crate::messages::{Entry, Membership};
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::{Application, LogData};
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,7 @@ impl<D: LogData, S> LogRangeOrSnapshot<D, S> {
 
 #[derive(Debug, Clone, Default)]
 pub struct HardState {
+    pub database_id: DatabaseId,
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
 }

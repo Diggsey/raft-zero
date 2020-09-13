@@ -18,7 +18,7 @@ use crate::observer::{ObservedState, Observer, ObserverExt};
 use crate::replication_stream;
 use crate::storage::{BoxAsyncWrite, HardState, LogRange, Snapshot, Storage, StorageExt};
 use crate::timer::TimerToken;
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::Application;
 
 use super::{ClientResult, NodeActor, NodeError, PrivateNodeExt};
@@ -40,6 +40,7 @@ pub(crate) struct CommonState<A: Application> {
     pub(crate) config: Arc<Config>,
 
     // Raft state
+    pub(crate) database_id: DatabaseId,
     pub(crate) current_term: Term,
     pub(crate) voted_for: Option<NodeId>,
     pub(crate) uncommitted_membership: Membership,
@@ -77,6 +78,7 @@ impl<A: Application> CommonState<A> {
             this_id,
             config,
 
+            database_id: DatabaseId::UNSET,
             current_term: Term(0),
             voted_for: None,
             uncommitted_membership: membership.clone(),
@@ -476,6 +478,7 @@ impl<A: Application> CommonState<A> {
     pub(crate) async fn save_hard_state(&self) -> Result<(), NodeError> {
         self.storage
             .call_save_hard_state(HardState {
+                database_id: self.database_id,
                 current_term: self.current_term,
                 voted_for: self.voted_for,
             })

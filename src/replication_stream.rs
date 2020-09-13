@@ -11,7 +11,7 @@ use crate::messages::{AppendEntriesResponse, Entry, InstallSnapshotResponse};
 use crate::node::{NodeActor, PrivateNodeExt};
 use crate::storage::{Snapshot, Storage, StorageExt};
 use crate::timer::TimerToken;
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::Application;
 
 mod log_replication;
@@ -126,6 +126,7 @@ struct SharedState<A: Application> {
     storage: Addr<dyn Storage<A>>,
     commit_state: Addr<Local<CommitStateActor>>,
     awaiting_response: bool,
+    database_id: DatabaseId,
     leader_id: NodeId,
     node_id: NodeId,
     timer_token: TimerToken,
@@ -142,6 +143,7 @@ impl<A: Application> ReplicationStreamActor<A> {
         node_id: NodeId,
         owner: WeakAddr<Local<NodeActor<A>>>,
         leader_id: NodeId,
+        database_id: DatabaseId,
         leader_state: LeaderState,
         config: Arc<Config>,
         connection: Addr<dyn Connection<A>>,
@@ -158,6 +160,7 @@ impl<A: Application> ReplicationStreamActor<A> {
             shared: SharedState {
                 this: WeakAddr::default(),
                 node_id,
+                database_id,
                 leader_state,
                 config,
                 connection,

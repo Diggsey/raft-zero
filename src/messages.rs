@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{LogIndex, NodeId, Term};
+use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::{Application, LogData, LogResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesRequest<A: Application> {
+    /// The unique database ID
+    pub database_id: DatabaseId,
     /// The leader's current term.
     pub term: Term,
     /// The leader's ID. Useful in redirecting clients.
@@ -59,6 +61,8 @@ pub struct ConflictOpt {
 /// An RPC invoked by candidates to gather votes (§5.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteRequest {
+    /// The unique database ID
+    pub database_id: DatabaseId,
     /// The candidate's current term.
     pub term: Term,
     /// The candidate's ID.
@@ -81,6 +85,8 @@ pub struct VoteResponse {
 /// An RPC invoked by candidates to gather votes (§5.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreVoteRequest {
+    /// The unique database ID
+    pub database_id: DatabaseId,
     /// The term which we will enter if the pre-vote succeeds.
     pub next_term: Term,
     /// The candidate's ID.
@@ -102,6 +108,8 @@ pub struct PreVoteResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstallSnapshotRequest {
+    /// The unique database ID
+    pub database_id: DatabaseId,
     /// The leader's current term.
     pub term: Term,
     /// The leader's ID. Useful in redirecting clients.

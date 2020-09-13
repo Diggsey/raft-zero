@@ -56,6 +56,7 @@ impl<A: Application> SnapshotReplication<A> {
             .connection
             .call_install_snapshot(InstallSnapshotRequest {
                 leader_id: shared.leader_id,
+                database_id: shared.database_id,
                 term: shared.leader_state.term,
                 last_included_index: self.snapshot.last_log_index,
                 last_included_term: self.snapshot.last_log_term,

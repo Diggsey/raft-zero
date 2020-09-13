@@ -1,5 +1,6 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -71,5 +72,22 @@ impl SubAssign<u64> for LogIndex {
     fn sub_assign(&mut self, other: u64) {
         assert!(self.0 >= other);
         self.0 -= other;
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub struct DatabaseId(pub u64);
+
+impl DatabaseId {
+    pub const UNSET: Self = Self(0);
+
+    pub fn new() -> Self {
+        Self(Utc::now().timestamp_nanos() as u64)
+    }
+
+    pub fn is_set(self) -> bool {
+        self != Self::UNSET
     }
 }
