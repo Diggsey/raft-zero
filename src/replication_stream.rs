@@ -52,6 +52,7 @@ trait PrivateReplicationStream {
         deadline: Instant,
     );
     fn handle_install_snapshot_response(&self, resp: InstallSnapshotResponse);
+    fn handle_missed_response(&self);
 }
 
 pub enum ReplicationError {
@@ -272,6 +273,8 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         // Wait for the RPC response, at least until deadline has expired
         if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
             self.handle_append_entries_response(count, res);
+        } else {
+            self.handle_missed_response();
         }
         // Wait for deadline
         delay_until(deadline).await;
@@ -305,6 +308,7 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
             self.handle_install_snapshot_response(res);
         } else {
+            self.handle_missed_response();
             // Wait for deadline
             delay_until(deadline).await;
             self.timer_tick(token);
@@ -324,5 +328,12 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
 
         // Check if we need to switch replication modes
         self.handle_mode_change(res).await
+    }
+    async fn handle_missed_response(&mut self) -> Result<(), ReplicationError> {
+        self.owner
+            .call_record_term(Term(0), self.shared.node_id, false)
+            .await
+            .map_err(|_| ReplicationError::Stopping)?;
+        Ok(())
     }
 }

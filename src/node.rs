@@ -5,6 +5,7 @@ use tokio::time::{delay_until, Instant};
 use act_zero::*;
 
 use crate::commit_state::CommitStateReceiverImpl;
+use crate::config::MembershipChangeCond;
 use crate::connection::ConnectionExt;
 use crate::election_state::ElectionState;
 use crate::messages::{
@@ -483,7 +484,7 @@ impl<A: Application> Node<A> for NodeActor<A> {
             return Ok(());
         }
 
-        // Check if a majority of new nodes are up to date
+        // Check that sufficiently many nodes are up-to-date
         if let Role::Leader(leader_state) = &mut self.role {
             let this_id = self.state.this_id;
             let lagging_ids: HashSet<NodeId> = req
@@ -493,7 +494,22 @@ impl<A: Application> Node<A> for NodeActor<A> {
                 .filter(|&node_id| !leader_state.is_up_to_date(this_id, node_id))
                 .collect();
             let num_up_to_date = req.ids.len() - lagging_ids.len();
-            if num_up_to_date == 0 || (((num_up_to_date - 1) / 2) as u64) < req.fault_tolerance {
+            let min_up_to_date =
+                num_up_to_date > 0 && (((num_up_to_date - 1) / 2) as u64) >= req.fault_tolerance;
+
+            let allowed_by_cond = match self.state.config.membership_change_cond {
+                MembershipChangeCond::MinimumUpToDate => min_up_to_date,
+                MembershipChangeCond::NewUpToDate => {
+                    min_up_to_date
+                        && !lagging_ids.iter().any(|&lagging_id| {
+                            self.state
+                                .uncommitted_membership
+                                .is_learner_or_unknown(lagging_id)
+                        })
+                }
+                MembershipChangeCond::AllUpToDate => lagging_ids.is_empty(),
+            };
+            if !allowed_by_cond {
                 // Too many lagging members
                 res.send(Err(ClientError::SetMembers(
                     SetMembersError::LaggingMembers { ids: lagging_ids },

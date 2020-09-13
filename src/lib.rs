@@ -19,7 +19,7 @@ mod storage;
 mod timer;
 mod types;
 
-pub use config::Config;
+pub use config::{Config, MembershipChangeCond};
 pub use connection::{Connection, ConnectionExt, ConnectionImpl};
 pub use node::{ClientResult, Node, NodeActor, NodeExt};
 pub use observer::{ObservedState, Observer, ObserverExt, ObserverImpl};

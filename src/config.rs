@@ -1,6 +1,20 @@
 use std::time::Duration;
 
 #[derive(Debug)]
+#[non_exhaustive]
+pub enum MembershipChangeCond {
+    /// Sufficient nodes from the target configuration must be
+    /// up-to-date such that the requested fault tolerance can be
+    /// respected.
+    MinimumUpToDate,
+    /// In addition to the minimum requirements, all new nodes must
+    /// be up-to-date.
+    NewUpToDate,
+    /// All nodes in the target configuration must be up-to-date.
+    AllUpToDate,
+}
+
+#[derive(Debug)]
 pub struct Config {
     pub(crate) heartbeat_interval: Duration,
     pub(crate) min_election_timeout: Duration,
@@ -11,6 +25,7 @@ pub struct Config {
     pub(crate) snapshot_chunk_size: u64,
     pub(crate) pre_vote: bool,
     pub(crate) leader_stickiness: bool,
+    pub(crate) membership_change_cond: MembershipChangeCond,
 }
 
 impl Config {
@@ -25,6 +40,7 @@ impl Config {
             snapshot_chunk_size: 16 * 1024,
             pre_vote: true,
             leader_stickiness: true,
+            membership_change_cond: MembershipChangeCond::NewUpToDate,
         }
     }
     pub fn set_heartbeat_interval(&mut self, value: Duration) -> &mut Self {
@@ -55,6 +71,10 @@ impl Config {
     }
     pub fn set_leader_stickiness(&mut self, value: bool) -> &mut Self {
         self.leader_stickiness = value;
+        self
+    }
+    pub fn set_membership_change_cond(&mut self, value: MembershipChangeCond) -> &mut Self {
+        self.membership_change_cond = value;
         self
     }
 }
