@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
-use tokio::time::{delay_until, timeout_at, Instant};
+use thiserror::Error;
 
+use act_zero::runtimes::default::Timer;
+use act_zero::timer::Tick;
 use act_zero::*;
+use async_trait::async_trait;
 
 use crate::commit_state::CommitStateActor;
 use crate::config::Config;
 use crate::connection::Connection;
 use crate::messages::{AppendEntriesResponse, Entry, InstallSnapshotResponse};
-use crate::node::{NodeActor, PrivateNodeExt};
-use crate::storage::{Snapshot, Storage, StorageExt};
-use crate::timer::TimerToken;
+use crate::node::NodeActor;
+use crate::storage::{Snapshot, Storage};
 use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::Application;
 
@@ -28,35 +30,21 @@ pub(crate) struct LeaderState {
     pub last_log_term: Term,
 }
 
-#[act_zero]
+#[async_trait]
 pub(crate) trait ReplicationStream<A: Application> {
-    fn append_entry(&self, leader_state: LeaderState, entry: Arc<Entry<A::LogData>>);
-    fn update_leader_state(&self, leader_state: LeaderState);
+    async fn append_entry(
+        &mut self,
+        leader_state: LeaderState,
+        entry: Arc<Entry<A::LogData>>,
+    ) -> ActorResult<()>;
+    async fn update_leader_state(&mut self, leader_state: LeaderState) -> ActorResult<()>;
 }
 
-#[act_zero]
-trait PrivateReplicationStream {
-    fn timer_tick(&self, token: TimerToken);
-    fn await_append_entries_response(
-        &self,
-        count: u64,
-        receiver: Receiver<AppendEntriesResponse>,
-        token: TimerToken,
-        deadline: Instant,
-    );
-    fn handle_append_entries_response(&self, count: u64, resp: AppendEntriesResponse);
-    fn await_install_snapshot_response(
-        &self,
-        receiver: Receiver<InstallSnapshotResponse>,
-        token: TimerToken,
-        deadline: Instant,
-    );
-    fn handle_install_snapshot_response(&self, resp: InstallSnapshotResponse);
-    fn handle_missed_response(&self);
-}
-
+#[derive(Debug, Error)]
 pub enum ReplicationError {
+    #[error("Node stopping")]
     Stopping,
+    #[error("Storage actor returned an error")]
     StorageFailure,
 }
 
@@ -119,21 +107,21 @@ impl<A: Application> ReplicationMode<A> {
 }
 
 struct SharedState<A: Application> {
-    this: WeakAddr<Local<ReplicationStreamActor<A>>>,
+    this: WeakAddr<ReplicationStreamActor<A>>,
     leader_state: LeaderState,
     config: Arc<Config>,
     connection: Addr<dyn Connection<A>>,
     storage: Addr<dyn Storage<A>>,
-    commit_state: Addr<Local<CommitStateActor>>,
+    commit_state: Addr<CommitStateActor>,
     awaiting_response: bool,
     database_id: DatabaseId,
     leader_id: NodeId,
     node_id: NodeId,
-    timer_token: TimerToken,
+    timer: Timer,
 }
 
 pub(crate) struct ReplicationStreamActor<A: Application> {
-    owner: WeakAddr<Local<NodeActor<A>>>,
+    owner: WeakAddr<NodeActor<A>>,
     mode: ReplicationMode<A>,
     shared: SharedState<A>,
 }
@@ -141,14 +129,14 @@ pub(crate) struct ReplicationStreamActor<A: Application> {
 impl<A: Application> ReplicationStreamActor<A> {
     pub(crate) fn new(
         node_id: NodeId,
-        owner: WeakAddr<Local<NodeActor<A>>>,
+        owner: WeakAddr<NodeActor<A>>,
         leader_id: NodeId,
         database_id: DatabaseId,
         leader_state: LeaderState,
         config: Arc<Config>,
         connection: Addr<dyn Connection<A>>,
         storage: Addr<dyn Storage<A>>,
-        commit_state: Addr<Local<CommitStateActor>>,
+        commit_state: Addr<CommitStateActor>,
     ) -> Self {
         Self {
             owner,
@@ -168,27 +156,24 @@ impl<A: Application> ReplicationStreamActor<A> {
                 awaiting_response: false,
                 commit_state,
                 leader_id,
-                timer_token: TimerToken::default(),
+                timer: Default::default(),
             },
         }
     }
-    async fn handle_response(
-        &mut self,
-        term: Term,
-        is_up_to_date: bool,
-    ) -> Result<(), ReplicationError> {
+    async fn handle_response(&mut self, term: Term, is_up_to_date: bool) -> ActorResult<()> {
         // Regardless of result, record the term
-        self.owner
-            .call_record_term(term, self.shared.node_id, is_up_to_date)
-            .await
-            .map_err(|_| ReplicationError::Stopping)?;
+        call!(self
+            .owner
+            .record_term(term, self.shared.node_id, is_up_to_date))
+        .await
+        .map_err(|_| ReplicationError::Stopping)?;
         self.shared.awaiting_response = false;
-        Ok(())
+        Produces::ok(())
     }
     async fn handle_mode_change(
         &mut self,
         mut arg: Result<(), ErrorOrChange<A>>,
-    ) -> Result<(), ReplicationError> {
+    ) -> ActorResult<()> {
         while match arg {
             Err(ErrorOrChange::Change(ChangeMode::Log {
                 match_index,
@@ -202,10 +187,7 @@ impl<A: Application> ReplicationStreamActor<A> {
                 Ok(true)
             }
             Err(ErrorOrChange::Change(ChangeMode::Snapshot { snapshot })) => {
-                let box_read = self
-                    .shared
-                    .storage
-                    .call_read_snapshot(snapshot.id.clone())
+                let box_read = call!(self.shared.storage.read_snapshot(snapshot.id.clone()))
                     .await
                     .map_err(|_| ReplicationError::StorageFailure)?;
                 self.mode = ReplicationMode::Snapshot(SnapshotReplication::new(
@@ -220,74 +202,66 @@ impl<A: Application> ReplicationStreamActor<A> {
         }? {
             arg = self.mode.kickstart(&mut self.shared).await;
         }
-        Ok(())
+        Produces::ok(())
     }
 }
 
+#[async_trait]
 impl<A: Application> Actor for ReplicationStreamActor<A> {
-    type Error = ReplicationError;
-
-    fn started(&mut self, addr: Addr<Local<Self>>) -> Result<(), Self::Error>
+    async fn started(&mut self, addr: Addr<Self>) -> ActorResult<()>
     where
         Self: Sized,
     {
         self.shared.this = addr.downgrade();
-        Ok(())
+        Produces::ok(())
     }
 }
 
-#[act_zero]
+#[async_trait]
 impl<A: Application> ReplicationStream<A> for ReplicationStreamActor<A> {
     // The leader state should have the entry being appended as its last log index
-    async fn append_entry(&mut self, leader_state: LeaderState, entry: Arc<Entry<A::LogData>>) {
+    async fn append_entry(
+        &mut self,
+        leader_state: LeaderState,
+        entry: Arc<Entry<A::LogData>>,
+    ) -> ActorResult<()> {
         self.shared.leader_state = leader_state;
         if let ReplicationMode::Log(log_replication) = &mut self.mode {
             log_replication.append_entry(&mut self.shared, entry).await;
         }
+        Produces::ok(())
     }
-    async fn update_leader_state(&mut self, leader_state: LeaderState) {
+    async fn update_leader_state(&mut self, leader_state: LeaderState) -> ActorResult<()> {
         self.shared.leader_state = leader_state;
         if let ReplicationMode::Log(log_replication) = &mut self.mode {
             if !self.shared.awaiting_response {
                 log_replication.flush_buffer(&mut self.shared);
             }
         }
+        Produces::ok(())
     }
 }
 
-#[act_zero]
-impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
-    async fn timer_tick(&mut self, token: TimerToken) {
-        // Ignore spurious wake-ups from cancelled timeouts
-        if token != self.shared.timer_token {
-            return;
+#[async_trait]
+impl<A: Application> Tick for ReplicationStreamActor<A> {
+    async fn tick(&mut self) -> ActorResult<()> {
+        if self.shared.timer.tick() {
+            if self.shared.awaiting_response {
+                self.handle_missed_response().await?;
+            }
+            // It's time to send a heartbeat, even if the buffer is empty
+            self.mode.flush_buffer(&mut self.shared);
         }
+        Produces::ok(())
+    }
+}
 
-        // It's time to send a heartbeat, even if the buffer is empty
-        self.mode.flush_buffer(&mut self.shared);
-    }
-    async fn await_append_entries_response(
-        self: Addr<Local<ReplicationStreamActor<A>>>,
-        count: u64,
-        receiver: Receiver<AppendEntriesResponse>,
-        token: TimerToken,
-        deadline: Instant,
-    ) {
-        // Wait for the RPC response, at least until deadline has expired
-        if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
-            self.handle_append_entries_response(count, res);
-        } else {
-            self.handle_missed_response();
-        }
-        // Wait for deadline
-        delay_until(deadline).await;
-        self.timer_tick(token);
-    }
+impl<A: Application> ReplicationStreamActor<A> {
     async fn handle_append_entries_response(
         &mut self,
         count: u64,
         resp: AppendEntriesResponse,
-    ) -> Result<(), ReplicationError> {
+    ) -> ActorResult<()> {
         // Regardless of result, record the term
         let is_up_to_date = resp.success && self.mode.is_up_to_date(&self.shared);
         self.handle_response(resp.term, is_up_to_date).await?;
@@ -301,26 +275,10 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         // Check if we need to switch replication modes
         self.handle_mode_change(res).await
     }
-    async fn await_install_snapshot_response(
-        self: Addr<Local<ReplicationStreamActor<A>>>,
-        receiver: Receiver<InstallSnapshotResponse>,
-        token: TimerToken,
-        deadline: Instant,
-    ) {
-        // Wait for the RPC response, at least until deadline has expired
-        if let Ok(Ok(res)) = timeout_at(deadline, receiver).await {
-            self.handle_install_snapshot_response(res);
-        } else {
-            self.handle_missed_response();
-            // Wait for deadline
-            delay_until(deadline).await;
-            self.timer_tick(token);
-        }
-    }
     async fn handle_install_snapshot_response(
         &mut self,
         resp: InstallSnapshotResponse,
-    ) -> Result<(), ReplicationError> {
+    ) -> ActorResult<()> {
         self.handle_response(resp.term, false).await?;
 
         let res = self
@@ -332,11 +290,11 @@ impl<A: Application> PrivateReplicationStream for ReplicationStreamActor<A> {
         // Check if we need to switch replication modes
         self.handle_mode_change(res).await
     }
-    async fn handle_missed_response(&mut self) -> Result<(), ReplicationError> {
-        self.owner
-            .call_record_term(Term(0), self.shared.node_id, false)
+    async fn handle_missed_response(&mut self) -> ActorResult<()> {
+        self.shared.awaiting_response = false;
+        call!(self.owner.record_term(Term(0), self.shared.node_id, false))
             .await
             .map_err(|_| ReplicationError::Stopping)?;
-        Ok(())
+        Produces::ok(())
     }
 }

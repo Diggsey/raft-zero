@@ -2,10 +2,11 @@ use std::cmp;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use futures::channel::oneshot;
 use rand::{thread_rng, Rng};
 use tokio::io::AsyncWriteExt;
-use tokio::time::Instant;
 
+use act_zero::runtimes::default::Timer;
 use act_zero::*;
 
 use crate::config::Config;
@@ -14,17 +15,16 @@ use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, ClientResponse, ConflictOpt, Entry, EntryPayload,
     InstallSnapshotRequest, Membership, ResponseMode,
 };
-use crate::observer::{ObservedState, Observer, ObserverExt};
+use crate::observer::{ObservedState, Observer};
 use crate::replication_stream;
-use crate::storage::{BoxAsyncWrite, HardState, LogRange, Snapshot, Storage, StorageExt};
-use crate::timer::TimerToken;
+use crate::storage::{BoxAsyncWrite, HardState, LogRange, Snapshot, Storage};
 use crate::types::{DatabaseId, LogIndex, NodeId, Term};
 use crate::Application;
 
-use super::{ClientResult, NodeActor, NodeError, PrivateNodeExt};
+use super::{ClientResult, NodeActor, NodeError};
 
 pub(crate) struct Notifier<A: Application> {
-    pub(crate) sender: Sender<ClientResult<A>>,
+    pub(crate) sender: oneshot::Sender<Produces<ClientResult<A>>>,
     pub(crate) mode: ResponseMode,
 }
 
@@ -52,14 +52,13 @@ pub(crate) struct CommonState<A: Application> {
     pub(crate) leader_id: Option<NodeId>,
 
     // Actors
-    pub(crate) this: WeakAddr<Local<NodeActor<A>>>,
+    pub(crate) this: WeakAddr<NodeActor<A>>,
     pub(crate) storage: Addr<dyn Storage<A>>,
     pub(crate) observer: Addr<dyn Observer>,
     pub(crate) connections: HashMap<NodeId, Addr<dyn Connection<A>>>,
 
     // Timer
-    timer_token: TimerToken,
-    timer_deadline: Option<Instant>,
+    pub(crate) timer: Timer,
 
     // Other
     last_observed_state: ObservedState,
@@ -92,8 +91,7 @@ impl<A: Application> CommonState<A> {
             observer,
             connections: HashMap::new(),
 
-            timer_token: TimerToken::default(),
-            timer_deadline: None,
+            timer: Default::default(),
 
             last_observed_state: ObservedState::default(),
             installing_snapshot: None,
@@ -109,12 +107,12 @@ impl<A: Application> CommonState<A> {
             committed_index: self.committed_index,
             committed_term: self.committed_term,
             voted_for: self.voted_for,
-            election_deadline: self.timer_deadline.map(Into::into),
+            election_deadline: self.timer.state().deadline(),
         };
 
         if observed_state != self.last_observed_state {
             self.last_observed_state = observed_state.clone();
-            self.observer.observe_state(observed_state);
+            send!(self.observer.observe_state(observed_state));
         }
     }
     pub(crate) fn last_log_index(&self) -> LogIndex {
@@ -140,16 +138,10 @@ impl<A: Application> CommonState<A> {
             self.config.min_election_timeout,
             self.config.max_election_timeout,
         );
-        let deadline = Instant::now() + timeout;
-        self.timer_deadline = Some(deadline);
-        self.this.set_timeout(self.timer_token.inc(), deadline);
+        self.timer.set_timeout_for_weak(self.this.clone(), timeout);
     }
     pub(crate) fn clear_election_timeout(&mut self) {
-        self.timer_deadline = None;
-        self.timer_token.inc();
-    }
-    pub(crate) fn election_timed_out(&self, token: TimerToken) -> bool {
-        self.timer_token == token
+        self.timer.clear();
     }
     pub(crate) fn state_for_replication(&self) -> replication_stream::LeaderState {
         replication_stream::LeaderState {
@@ -184,8 +176,9 @@ impl<A: Application> CommonState<A> {
                         .unwrap_or_else(|| app.establish_connection(node_id))
                 });
 
-        self.observer
-            .observe_membership(self.uncommitted_membership.clone());
+        send!(self
+            .observer
+            .observe_membership(self.uncommitted_membership.clone()));
     }
     pub(crate) fn is_up_to_date(&self, last_log_term: Term, last_log_index: LogIndex) -> bool {
         last_log_term > self.last_log_term()
@@ -196,19 +189,17 @@ impl<A: Application> CommonState<A> {
             && (self.voted_for.is_none() || self.voted_for == Some(candidate_id))
     }
     pub(crate) async fn load_log_state(&mut self) -> Result<(), NodeError> {
-        let log_state = self
-            .storage
-            .call_get_log_state()
+        let log_state = call!(self.storage.get_log_state())
             .await
             .map_err(|_| NodeError::StorageFailure)?;
 
-        let loaded_range = self
+        let loaded_range = call!(self
             .storage
-            .call_get_log_range(log_state.last_log_applied + 1..log_state.last_log_index + 1)
-            .await
-            .map_err(|_| NodeError::StorageFailure)?
-            .log_range()
-            .ok_or(NodeError::SafetyViolation)?;
+            .get_log_range(log_state.last_log_applied + 1..log_state.last_log_index + 1))
+        .await
+        .map_err(|_| NodeError::StorageFailure)?
+        .log_range()
+        .ok_or(NodeError::SafetyViolation)?;
 
         self.committed_index = log_state.last_log_index;
         self.committed_term = loaded_range.prev_log_term;
@@ -250,8 +241,7 @@ impl<A: Application> CommonState<A> {
             );
 
         // Replicate the entries to storage
-        self.storage
-            .call_replicate_to_log(log_range)
+        call!(self.storage.replicate_to_log(log_range))
             .await
             .map_err(|_| NodeError::StorageFailure)
     }
@@ -262,9 +252,7 @@ impl<A: Application> CommonState<A> {
     ) -> Result<bool, NodeError> {
         // It's a new snapshot
         if req.offset == 0 {
-            let (snapshot_id, target) = self
-                .storage
-                .call_create_snapshot()
+            let (snapshot_id, target) = call!(self.storage.create_snapshot())
                 .await
                 .map_err(|_| NodeError::StorageFailure)?;
 
@@ -295,8 +283,7 @@ impl<A: Application> CommonState<A> {
                     return Ok(false);
                 }
 
-                self.storage
-                    .call_install_snapshot(snapshot)
+                call!(self.storage.install_snapshot(snapshot))
                     .await
                     .map_err(|_| NodeError::StorageFailure)?;
 
@@ -449,40 +436,43 @@ impl<A: Application> CommonState<A> {
             }
 
             // Spawn a task to update the application state machine
-            let receiver = self
+            let receiver = call!(self
                 .storage
-                .call_apply_to_state_machine(self.committed_index, uncommitted_entry.entry);
+                .apply_to_state_machine(self.committed_index, uncommitted_entry.entry));
 
             if let Some(notify) = uncommitted_entry.notify {
                 match notify.mode {
                     ResponseMode::Committed => {
                         notify
                             .sender
-                            .send(Ok(ClientResponse {
+                            .send(Produces::Value(Ok(ClientResponse {
                                 data: None,
                                 term: self.committed_term,
                                 index: self.committed_index,
-                            }))
+                            })))
                             .ok();
                     }
-                    ResponseMode::Applied => self.this.send_log_response(
-                        self.committed_term,
-                        self.committed_index,
-                        receiver,
-                        notify.sender,
-                    ),
+                    ResponseMode::Applied => {
+                        notify
+                            .sender
+                            .send(call!(self.this.send_log_response(
+                                self.committed_term,
+                                self.committed_index,
+                                receiver
+                            )))
+                            .ok();
+                    }
                 }
             }
         }
     }
     pub(crate) async fn save_hard_state(&self) -> Result<(), NodeError> {
-        self.storage
-            .call_save_hard_state(HardState {
-                database_id: self.database_id,
-                current_term: self.current_term,
-                voted_for: self.voted_for,
-            })
-            .await
-            .map_err(|_| NodeError::StorageFailure)
+        call!(self.storage.save_hard_state(HardState {
+            database_id: self.database_id,
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+        }))
+        .await
+        .map_err(|_| NodeError::StorageFailure)
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use act_zero::*;
+use async_trait::async_trait;
 
 use crate::messages::{Entry, Membership};
 use crate::types::{DatabaseId, LogIndex, NodeId, Term};
@@ -70,31 +71,28 @@ pub struct HardState {
     pub voted_for: Option<NodeId>,
 }
 
-#[act_zero]
-pub trait Storage<A: Application> {
-    fn init(&self, res: Sender<HardState>);
+#[async_trait]
+pub trait Storage<A: Application>: Actor {
+    async fn init(&mut self) -> ActorResult<HardState>;
 
-    fn get_log_state(&self, res: Sender<LogState>);
-    fn get_log_range(
-        &self,
+    async fn get_log_state(&mut self) -> ActorResult<LogState>;
+    async fn get_log_range(
+        &mut self,
         range: Range<LogIndex>,
-        res: Sender<LogRangeOrSnapshot<A::LogData, A::SnapshotId>>,
-    );
-    fn append_entry_to_log(
-        &self,
+    ) -> ActorResult<LogRangeOrSnapshot<A::LogData, A::SnapshotId>>;
+    async fn append_entry_to_log(
+        &mut self,
         entry: Arc<Entry<A::LogData>>,
-        res: Sender<Result<(), A::LogError>>,
-    );
-    fn replicate_to_log(&self, range: LogRange<A::LogData>, res: Sender<()>);
-    fn apply_to_state_machine(
-        &self,
+    ) -> ActorResult<Result<(), A::LogError>>;
+    async fn replicate_to_log(&mut self, range: LogRange<A::LogData>) -> ActorResult<()>;
+    async fn apply_to_state_machine(
+        &mut self,
         index: LogIndex,
         entry: Arc<Entry<A::LogData>>,
-        res: Sender<A::LogResponse>,
-    );
-    fn save_hard_state(&self, hs: HardState, res: Sender<()>);
+    ) -> ActorResult<A::LogResponse>;
+    async fn save_hard_state(&mut self, hs: HardState) -> ActorResult<()>;
 
-    fn install_snapshot(&self, snapshot: Snapshot<A::SnapshotId>, res: Sender<()>);
-    fn create_snapshot(&self, res: Sender<(A::SnapshotId, BoxAsyncWrite)>);
-    fn read_snapshot(&self, id: A::SnapshotId, res: Sender<BoxAsyncRead>);
+    async fn install_snapshot(&mut self, snapshot: Snapshot<A::SnapshotId>) -> ActorResult<()>;
+    async fn create_snapshot(&mut self) -> ActorResult<(A::SnapshotId, BoxAsyncWrite)>;
+    async fn read_snapshot(&mut self, id: A::SnapshotId) -> ActorResult<BoxAsyncRead>;
 }

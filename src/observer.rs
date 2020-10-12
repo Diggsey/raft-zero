@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use act_zero::*;
+use async_trait::async_trait;
 
 use crate::messages::Membership;
 use crate::types::{LogIndex, NodeId, Term};
@@ -18,8 +19,12 @@ pub struct ObservedState {
     pub election_deadline: Option<Instant>,
 }
 
-#[act_zero]
-pub trait Observer {
-    fn observe_state(&self, _state: ObservedState) {}
-    fn observe_membership(&self, _membership: Membership) {}
+#[async_trait]
+pub trait Observer: Actor + Send {
+    async fn observe_state(&mut self, _state: ObservedState) -> ActorResult<()> {
+        Produces::ok(())
+    }
+    async fn observe_membership(&mut self, _membership: Membership) -> ActorResult<()> {
+        Produces::ok(())
+    }
 }

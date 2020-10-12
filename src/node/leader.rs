@@ -1,27 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use act_zero::runtimes::default::spawn_actor;
 use act_zero::*;
 
-use crate::commit_state::{CommitStateActor, CommitStateExt};
+use crate::commit_state::{CommitState, CommitStateActor};
 use crate::messages::{ClientError, Entry, EntryPayload};
-use crate::replication_stream::{self, ReplicationStreamActor, ReplicationStreamExt};
-use crate::storage::StorageExt;
+use crate::replication_stream::{self, ReplicationStream, ReplicationStreamActor};
 use crate::types::NodeId;
-use crate::{spawn_actor, Application};
+use crate::Application;
 
 use super::common::{CommonState, Notifier, UncommittedEntry};
-use super::{NodeError, PrivateNodeExt, ReplicationState, ReplicationStreamMap};
+use super::{NodeError, ReplicationState, ReplicationStreamMap};
 
 pub(crate) struct LeaderState<A: Application> {
-    commit_state: Addr<Local<CommitStateActor>>,
+    commit_state: Addr<CommitStateActor>,
     replication_streams: ReplicationStreamMap<A>,
 }
 
 fn build_replication_streams<A: Application>(
     state: &CommonState<A>,
     state_for_rep: replication_stream::LeaderState,
-    commit_state: &Addr<Local<CommitStateActor>>,
+    commit_state: &Addr<CommitStateActor>,
     prev_streams: &mut ReplicationStreamMap<A>,
 ) -> ReplicationStreamMap<A> {
     state
@@ -62,11 +62,11 @@ impl<A: Application> LeaderState<A> {
             state.current_term,
             state.uncommitted_membership.clone(),
             state.committed_index,
-            state.this.clone().upcast(),
+            upcast!(state.this.clone()),
         ));
 
         // Replicate a blank entry on election to ensure we have an entry from our own term
-        state.this.send_blank_entry();
+        send!(state.this.send_blank_entry());
 
         let state_for_rep = state.state_for_replication();
 
@@ -92,15 +92,16 @@ impl<A: Application> LeaderState<A> {
         });
 
         // First, try to append the entry to our own log
-        if let Err(e) = state
-            .storage
-            .call_append_entry_to_log(entry.clone())
+        if let Err(e) = call!(state.storage.append_entry_to_log(entry.clone()))
             .await
             .map_err(|_| NodeError::StorageFailure)?
         {
             // Entry rejected by application, report the error to the caller
             if let Some(notify) = notify {
-                notify.sender.send(Err(ClientError::Application(e))).ok();
+                notify
+                    .sender
+                    .send(Produces::Value(Err(ClientError::Application(e))))
+                    .ok();
             }
             return Ok(());
         }
@@ -118,8 +119,9 @@ impl<A: Application> LeaderState<A> {
         // If this was a membership change, update our membership
         if entry.is_membership_change() {
             state.update_membership();
-            self.commit_state
-                .set_membership(state.uncommitted_membership.clone());
+            send!(self
+                .commit_state
+                .set_membership(state.uncommitted_membership.clone()));
 
             // Build the replication streams using the old replication state
             self.replication_streams = build_replication_streams(
@@ -133,16 +135,17 @@ impl<A: Application> LeaderState<A> {
         // Replicate entry to other nodes
         let new_replication_state = state.state_for_replication();
         for rs in self.replication_streams.values() {
-            rs.addr
-                .append_entry(new_replication_state.clone(), entry.clone());
+            send!(rs
+                .addr
+                .append_entry(new_replication_state.clone(), entry.clone()));
         }
 
         // Update our own match index
-        self.commit_state.set_match_index(
+        send!(self.commit_state.set_match_index(
             state.this_id,
             state.last_log_index(),
-            state.last_log_term(),
-        );
+            state.last_log_term()
+        ));
 
         Ok(())
     }
@@ -150,7 +153,7 @@ impl<A: Application> LeaderState<A> {
     pub(crate) fn update_replication_state(&self, state: &CommonState<A>) {
         let new_replication_state = state.state_for_replication();
         for rs in self.replication_streams.values() {
-            rs.addr.update_leader_state(new_replication_state.clone());
+            send!(rs.addr.update_leader_state(new_replication_state.clone()));
         }
     }
 

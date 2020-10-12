@@ -1,4 +1,5 @@
 use act_zero::*;
+use async_trait::async_trait;
 
 use crate::messages::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -6,10 +7,16 @@ use crate::messages::{
 };
 use crate::Application;
 
-#[act_zero]
-pub trait Connection<A: Application> {
-    fn request_vote(&self, req: VoteRequest, res: Sender<VoteResponse>);
-    fn append_entries(&self, req: AppendEntriesRequest<A>, res: Sender<AppendEntriesResponse>);
-    fn install_snapshot(&self, req: InstallSnapshotRequest, res: Sender<InstallSnapshotResponse>);
-    fn request_pre_vote(&self, req: PreVoteRequest, res: Sender<PreVoteResponse>);
+#[async_trait]
+pub trait Connection<A: Application>: Actor {
+    async fn request_vote(&mut self, req: VoteRequest) -> ActorResult<VoteResponse>;
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<A>,
+    ) -> ActorResult<AppendEntriesResponse>;
+    async fn install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest,
+    ) -> ActorResult<InstallSnapshotResponse>;
+    async fn request_pre_vote(&mut self, req: PreVoteRequest) -> ActorResult<PreVoteResponse>;
 }

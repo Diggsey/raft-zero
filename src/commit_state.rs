@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use act_zero::*;
+use async_trait::async_trait;
 
 use crate::messages::Membership;
 use crate::types::{LogIndex, NodeId, Term};
@@ -52,22 +53,20 @@ impl CommitStateActor {
         // If the commit index has advanced, notify the receiver
         if new_commit_index > self.commit_index {
             self.commit_index = new_commit_index;
-            self.receiver.set_commit_index(self.term, new_commit_index);
+            send!(self.receiver.set_commit_index(self.term, new_commit_index));
         }
     }
 }
 
-impl Actor for CommitStateActor {
-    type Error = ();
+impl Actor for CommitStateActor {}
+
+#[async_trait]
+pub trait CommitState: Actor {
+    async fn set_match_index(&mut self, node: NodeId, match_index: LogIndex, match_term: Term);
+    async fn set_membership(&mut self, membership: Membership);
 }
 
-#[act_zero]
-pub trait CommitState {
-    fn set_match_index(&self, node: NodeId, match_index: LogIndex, match_term: Term);
-    fn set_membership(&self, membership: Membership);
-}
-
-#[act_zero]
+#[async_trait]
 impl CommitState for CommitStateActor {
     async fn set_match_index(&mut self, node: NodeId, match_index: LogIndex, match_term: Term) {
         if match_term == self.term {
@@ -88,7 +87,7 @@ impl CommitState for CommitStateActor {
     }
 }
 
-#[act_zero]
-pub trait CommitStateReceiver {
-    fn set_commit_index(&self, term: Term, commit_index: LogIndex);
+#[async_trait]
+pub trait CommitStateReceiver: Actor {
+    async fn set_commit_index(&mut self, term: Term, commit_index: LogIndex) -> ActorResult<()>;
 }
